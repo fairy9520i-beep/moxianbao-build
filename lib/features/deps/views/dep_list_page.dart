@@ -1,0 +1,1935 @@
+import 'package:dio/dio.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
+import '../../../core/network/dio_client.dart';
+import '../../../core/network/api_endpoints.dart';
+import '../../../core/network/sse_client.dart';
+import '../../../core/theme/app_theme.dart';
+import '../../../core/theme/design_tokens.dart';
+import '../../../shared/models/dependency.dart';
+import '../../../shared/models/python_runtime_info.dart';
+import '../../../shared/utils/api_utils.dart';
+import '../../../shared/utils/ansi_text.dart';
+import '../../../shared/utils/log_background.dart';
+import '../../../shared/utils/panel_enums.dart';
+import '../../../shared/utils/time_utils.dart';
+import '../../../shared/widgets/app_circle_add_button.dart';
+import '../../../shared/widgets/app_card.dart';
+import '../../../shared/widgets/app_notice.dart';
+import '../../../shared/widgets/app_back_button.dart';
+import '../../../shared/widgets/app_snack.dart';
+import '../../../shared/widgets/app_state_views.dart';
+
+/// 新建依赖时把输入框里的多个名字切开：换行、逗号、空白都算分隔，
+/// 但方括号里的逗号和空格不切（面板 #166：`httpx[http2,socks]` 要整个交给 pip，
+/// 原来按 `[\n,\s]+` 一刀切会变成 `httpx[http2` 和 `socks]` 两个装不上的名字）。
+/// 方括号里的空格直接去掉（`httpx[http2, socks]` → `httpx[http2,socks]`）；
+/// 换行无论如何都切，免得少写一个 `]` 把后面几行全吞成一个名字。
+List<String> splitDependencyNames(String raw) {
+  final parts = <String>[];
+  final current = StringBuffer();
+  var bracketDepth = 0;
+  for (final char in raw.split('')) {
+    final isLineBreak = char == '\n' || char == '\r';
+    final isSeparator = isLineBreak || char == ',' || char.trim().isEmpty;
+    if (bracketDepth > 0 && !isLineBreak) {
+      // 方括号里：逗号原样保留，空白丢掉，其余照抄
+      if (char.trim().isNotEmpty) current.write(char);
+    } else if (isSeparator) {
+      if (current.isNotEmpty) parts.add(current.toString());
+      current.clear();
+      bracketDepth = 0;
+      continue;
+    } else {
+      current.write(char);
+    }
+    if (char == '[') bracketDepth++;
+    if (char == ']' && bracketDepth > 0) bracketDepth--;
+  }
+  if (current.isNotEmpty) parts.add(current.toString());
+  return parts;
+}
+
+// ── Provider ──
+
+final depListProvider =StateNotifierProvider<DepListNotifier, DepListState>((
+  ref,
+) {
+  return DepListNotifier();
+});
+
+class DepListState {
+  final List<Dependency> items;
+  final bool loading;
+
+  /// 列表加载失败的原因。UI 据此把「拿不到数据」和「真的没有依赖」分开。
+  final String? error;
+  final String selectedType;
+  final String selectedPythonVersion;
+  final String pythonDefaultVersion;
+  final List<PythonRuntimeInfo> pythonRuntimes;
+  final bool runtimeLoading;
+
+  const DepListState({
+    this.items = const [],
+    this.loading = false,
+    this.error,
+    this.selectedType = 'nodejs',
+    this.selectedPythonVersion = '3.12',
+    this.pythonDefaultVersion = '3.12',
+    this.pythonRuntimes = const [],
+    this.runtimeLoading = false,
+  });
+
+  DepListState copyWith({
+    List<Dependency>? items,
+    bool? loading,
+    String? error,
+    String? selectedType,
+    String? selectedPythonVersion,
+    String? pythonDefaultVersion,
+    List<PythonRuntimeInfo>? pythonRuntimes,
+    bool? runtimeLoading,
+  }) {
+    return DepListState(
+      items: items ?? this.items,
+      loading: loading ?? this.loading,
+      // 刻意是裸 error：不传即清空，否则失败一次之后错误提示永远消不掉。
+      error: error,
+      selectedType: selectedType ?? this.selectedType,
+      selectedPythonVersion:
+          selectedPythonVersion ?? this.selectedPythonVersion,
+      pythonDefaultVersion: pythonDefaultVersion ?? this.pythonDefaultVersion,
+      pythonRuntimes: pythonRuntimes ?? this.pythonRuntimes,
+      runtimeLoading: runtimeLoading ?? this.runtimeLoading,
+    );
+  }
+}
+
+class DepMirrorConfig {
+  final String pipMirror;
+  final String npmMirror;
+  final String linuxMirror;
+  final String linuxPackageManager;
+  final String linuxDistribution;
+  final bool linuxMirrorSupported;
+  final String linuxMirrorLabel;
+  final String linuxMirrorMessage;
+
+  const DepMirrorConfig({
+    this.pipMirror = '',
+    this.npmMirror = '',
+    this.linuxMirror = '',
+    this.linuxPackageManager = '',
+    this.linuxDistribution = '',
+    this.linuxMirrorSupported = false,
+    this.linuxMirrorLabel = 'Linux',
+    this.linuxMirrorMessage = '',
+  });
+
+  factory DepMirrorConfig.fromJson(Map<String, dynamic> json) {
+    return DepMirrorConfig(
+      pipMirror: json['pip_mirror']?.toString() ?? '',
+      npmMirror: json['npm_mirror']?.toString() ?? '',
+      linuxMirror: json['linux_mirror']?.toString() ?? '',
+      linuxPackageManager: json['linux_package_manager']?.toString() ?? '',
+      linuxDistribution: json['linux_distribution']?.toString() ?? '',
+      linuxMirrorSupported: json['linux_mirror_supported'] == true,
+      linuxMirrorLabel: json['linux_mirror_label']?.toString() ?? 'Linux',
+      linuxMirrorMessage: json['linux_mirror_message']?.toString() ?? '',
+    );
+  }
+
+  DepMirrorConfig copyWith({
+    String? pipMirror,
+    String? npmMirror,
+    String? linuxMirror,
+    String? linuxPackageManager,
+    bool? linuxMirrorSupported,
+    String? linuxDistribution,
+    String? linuxMirrorLabel,
+    String? linuxMirrorMessage,
+  }) {
+    return DepMirrorConfig(
+      pipMirror: pipMirror ?? this.pipMirror,
+      npmMirror: npmMirror ?? this.npmMirror,
+      linuxMirror: linuxMirror ?? this.linuxMirror,
+      linuxPackageManager: linuxPackageManager ?? this.linuxPackageManager,
+      linuxMirrorSupported: linuxMirrorSupported ?? this.linuxMirrorSupported,
+      linuxDistribution: linuxDistribution ?? this.linuxDistribution,
+      linuxMirrorLabel: linuxMirrorLabel ?? this.linuxMirrorLabel,
+      linuxMirrorMessage: linuxMirrorMessage ?? this.linuxMirrorMessage,
+    );
+  }
+
+  /// 只挑出相对 [initial] 真改过的字段（对齐面板网页端 v3.3.2 / issue #146）。
+  ///
+  /// 面板 `PUT /deps/mirrors` 的三个字段是 `*string`：键不在 body 里，那一类源整个不动。
+  /// 以前恒提交三个键，会出三种事：dnf / yum 系统上空的 `linux_mirror` 必报 400
+  /// （而 pip / npm 已经先写进去了）；只改 npm 也会落下「用户选过镜像」的标记，
+  /// 把旧默认源的一次性迁移永久关掉；老面板上只改 pip 也会因为 apt 源「一条都没变」报错。
+  /// 空串也算改动 ——「恢复默认」就是清空，不算的话它永远发不出去。
+  Map<String, dynamic> changedRequestJson(DepMirrorConfig initial) => {
+    if (pipMirror.trim() != initial.pipMirror.trim())
+      'pip_mirror': pipMirror.trim(),
+    if (npmMirror.trim() != initial.npmMirror.trim())
+      'npm_mirror': npmMirror.trim(),
+    if (linuxMirror.trim() != initial.linuxMirror.trim())
+      'linux_mirror': linuxMirror.trim(),
+  };
+}
+
+class DepListNotifier extends StateNotifier<DepListState> {
+  /// [dio] **仅供测试注入**，生产路径不传，仍然走 `DioClient` 单例。
+  /// 单例的 baseUrl 会随切换面板被改写，所以这里不在构造时把它存下来。
+  DepListNotifier({Dio? dio}) : _injectedDio = dio, super(const DepListState());
+
+  final Dio? _injectedDio;
+
+  Dio get _dio => _injectedDio ?? DioClient.instance.dio;
+
+  Future<List<Dependency>> fetchByType(
+    String type, {
+    String? pythonVersion,
+  }) async {
+    // /api/deps 目前**根本不分页**：DepsHandler.List 只按 type 过滤后
+    // `query.Order(...).Find(&deps)` 全量返回（server/handler/deps.go:144-175），
+    // page / page_size 是被忽略的。所以这里原来的 200 不是 bug（另外两处
+    // subscription / task 才是，那两个端点有 100 上限、超了静默回落到 20）。
+    // 仍然改成 100：万一面板哪天给依赖也加上分页，100 才是不会触发回落的值。
+    final params = <String, dynamic>{'page': 1, 'page_size': 100, 'type': type};
+    if (type == 'python' && (pythonVersion ?? '').trim().isNotEmpty) {
+      params['python_version'] = pythonVersion!.trim();
+    }
+    final resp = await _dio.get(
+      ApiEndpoints.deps,
+      queryParameters: params,
+    );
+    final paginated = extractPaginated(resp.data);
+    return paginated.items.map(Dependency.fromJson).toList();
+  }
+
+  Future<void> load({String? type, String? pythonVersion}) async {
+    final nextType = type ?? state.selectedType;
+    final nextPythonVersion = pythonVersion ?? state.selectedPythonVersion;
+    state = state.copyWith(
+      selectedType: nextType,
+      selectedPythonVersion: nextPythonVersion,
+      loading: true,
+      error: null,
+    );
+    try {
+      final items = await fetchByType(
+        nextType,
+        pythonVersion: nextType == 'python' ? nextPythonVersion : null,
+      );
+      state = state.copyWith(items: items, loading: false);
+    } catch (e) {
+      // fetchByType 自己不 catch，异常原样抛到这里。
+      state = state.copyWith(
+        loading: false,
+        error: extractListErrorMessage(e, '加载依赖失败'),
+      );
+    }
+  }
+
+  Future<void> setType(String type) async {
+    await load(type: type);
+  }
+
+  Future<void> setPythonVersion(String version) async {
+    await load(type: 'python', pythonVersion: version);
+  }
+
+  Future<void> loadPythonRuntimes() async {
+    // 必须显式把 error 传回去。copyWith 是「不传即清空」语义（见 DepListState.copyWith），
+    // 这个方法拉的是 Python 运行时列表、跟依赖列表毫无关系，
+    // 不带上 error 就会顺手把「依赖列表加载失败」那条提示抹掉，页面退回空态。
+    // 现在两个调用点恰好都排在 load() 之前所以看不出问题，但顺序一调换就会静默吞掉错误。
+    state = state.copyWith(runtimeLoading: true, error: state.error);
+    try {
+      final resp = await _dio.get(
+        ApiEndpoints.depsPythonRuntimes,
+      );
+      final raw = resp.data;
+      final map = raw is Map<String, dynamic>
+          ? raw
+          : raw is Map
+          ? Map<String, dynamic>.from(raw)
+          : <String, dynamic>{};
+      final runtimeData = map['data'];
+      final runtimes = runtimeData is List
+          ? runtimeData
+                .whereType<Map>()
+                .map(
+                  (item) => PythonRuntimeInfo.fromJson(
+                    Map<String, dynamic>.from(item),
+                  ),
+                )
+                .where((item) => item.version.isNotEmpty)
+                .toList()
+          : <PythonRuntimeInfo>[];
+      final defaultVersion =
+          map['default_version']?.toString().trim().isNotEmpty == true
+          ? map['default_version'].toString().trim()
+          : state.pythonDefaultVersion;
+      final selectedStillExists = runtimes.any(
+        (runtime) => runtime.version == state.selectedPythonVersion,
+      );
+      state = state.copyWith(
+        pythonRuntimes: runtimes,
+        pythonDefaultVersion: defaultVersion,
+        selectedPythonVersion: selectedStillExists
+            ? state.selectedPythonVersion
+            : defaultVersion,
+        runtimeLoading: false,
+        error: state.error,
+      );
+    } catch (_) {
+      state = state.copyWith(runtimeLoading: false, error: state.error);
+    }
+  }
+
+  Future<void> setDefaultPythonRuntime(String version) async {
+    await _dio.put(
+      ApiEndpoints.depsPythonRuntimeDefault,
+      data: {'version': version},
+    );
+    await loadPythonRuntimes();
+    await load(type: 'python', pythonVersion: version);
+  }
+
+  Future<void> delete(int id, {bool force = false}) async {
+    await _dio.delete(
+      ApiEndpoints.depById(id),
+      queryParameters: force ? {'force': true} : null,
+    );
+    await load();
+  }
+
+  Future<void> batchDelete(List<int> ids) async {
+    await _dio.post(
+      ApiEndpoints.depsBatchDelete,
+      data: {'ids': ids},
+    );
+    await load();
+  }
+
+  Future<void> reinstall(int id) async {
+    await _dio.put(ApiEndpoints.depReinstall(id));
+    await load();
+  }
+
+  Future<void> cancel(int id) async {
+    await _dio.put(ApiEndpoints.depCancel(id));
+    await load();
+  }
+
+  Future<void> create({
+    required String type,
+    required List<String> names,
+  }) async {
+    await _dio.post(
+      ApiEndpoints.deps,
+      data: {
+        'type': type,
+        'names': names,
+        if (type == 'python') 'python_version': state.selectedPythonVersion,
+      },
+    );
+    await load();
+  }
+
+  Future<Map<String, dynamic>> getStatus(int id) async {
+    final resp = await _dio.get(ApiEndpoints.depStatus(id));
+    final data = extractData(resp.data);
+    if (data is Map<String, dynamic>) {
+      return data;
+    }
+    if (data is Map) {
+      return Map<String, dynamic>.from(data);
+    }
+    return <String, dynamic>{};
+  }
+
+  Future<DepMirrorConfig> getMirrors() async {
+    final resp = await _dio.get(ApiEndpoints.depsMirrors);
+    final data = extractData(resp.data);
+    if (data is Map<String, dynamic>) {
+      return DepMirrorConfig.fromJson(data);
+    }
+    if (data is Map) {
+      return DepMirrorConfig.fromJson(Map<String, dynamic>.from(data));
+    }
+    return const DepMirrorConfig();
+  }
+
+  /// [payload] 由 [DepMirrorConfig.changedRequestJson] 算出，只含改过的键。
+  Future<void> setMirrors(Map<String, dynamic> payload) async {
+    await _dio.put(
+      ApiEndpoints.depsMirrors,
+      data: payload,
+    );
+  }
+}
+
+// ── Page ──
+
+class _CreateDepRequest {
+  final String type;
+  final List<String> names;
+
+  const _CreateDepRequest({required this.type, required this.names});
+}
+
+class DepListPage extends ConsumerStatefulWidget {
+  const DepListPage({super.key});
+
+  @override
+  ConsumerState<DepListPage> createState() => _DepListPageState();
+}
+
+class _DepListPageState extends ConsumerState<DepListPage> {
+  final Set<int> _selectedIds = <int>{};
+  Map<String, int> _counts = const {'nodejs': 0, 'python': 0, 'linux': 0};
+  bool _countLoading = true;
+  bool _mirrorLoading = false;
+  bool _mirrorSaving = false;
+  String? _statusFilter;
+
+  @override
+  void initState() {
+    super.initState();
+    Future.microtask(_loadPageData);
+  }
+
+  Future<void> _loadPageData() async {
+    await ref.read(depListProvider.notifier).loadPythonRuntimes();
+    await Future.wait([
+      ref.read(depListProvider.notifier).load(),
+      _loadCounts(),
+    ]);
+    _trimSelection();
+  }
+
+  Future<void> _loadCounts() async {
+    final notifier = ref.read(depListProvider.notifier);
+    final state = ref.read(depListProvider);
+    try {
+      final results = await Future.wait([
+        notifier.fetchByType('nodejs'),
+        notifier.fetchByType(
+          'python',
+          pythonVersion: state.selectedPythonVersion,
+        ),
+        notifier.fetchByType('linux'),
+      ]);
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _counts = {
+          'nodejs': results[0].length,
+          'python': results[1].length,
+          'linux': results[2].length,
+        };
+        _countLoading = false;
+      });
+    } catch (_) {
+      if (!mounted) {
+        return;
+      }
+      setState(() => _countLoading = false);
+    }
+  }
+
+  void _trimSelection() {
+    final validIds = ref
+        .read(depListProvider)
+        .items
+        .map((dep) => dep.id)
+        .toSet();
+    _selectedIds.removeWhere((id) => !validIds.contains(id));
+  }
+
+  // 这个页面的每条提示都有明确成败，没有中性提示，所以不再保留 _showMessage。
+  void _showSuccess(String message) => AppSnack.success(context, message);
+
+  void _showError(String message) => AppSnack.error(context, message);
+
+  void _showWarning(String message) => AppSnack.warn(context, message);
+
+  String _extractError(Object error, String fallback) {
+    return extractErrorMessage(error, fallback);
+  }
+
+  /// 依赖类型标签。兜底**不再**是 'NodeJS' —— 面板新增一种依赖类型时，
+  /// 那会把一个 Go / Rust 依赖显示成 NodeJS 依赖，用户按 npm 的思路去排查。
+  /// 换算表见 shared/utils/panel_enums.dart。
+  String _typeLabel(String type) => dependencyTypeLabel(type);
+
+  List<String> _parseNames(String raw, bool autoSplit) {
+    if (!autoSplit) {
+      final trimmed = raw.trim();
+      return trimmed.isEmpty ? const [] : [trimmed];
+    }
+    return splitDependencyNames(raw).toSet().toList();
+  }
+
+  Future<void> _changeType(String type) async {
+    await ref.read(depListProvider.notifier).setType(type);
+    if (!mounted) {
+      return;
+    }
+    setState(() => _selectedIds.clear());
+    await _loadCounts();
+  }
+
+  Future<void> _changePythonVersion(String version) async {
+    await ref.read(depListProvider.notifier).setPythonVersion(version);
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _selectedIds.clear();
+      _statusFilter = null;
+    });
+    await _loadCounts();
+  }
+
+  Future<void> _setPythonDefault() async {
+    final state = ref.read(depListProvider);
+    try {
+      await ref
+          .read(depListProvider.notifier)
+          .setDefaultPythonRuntime(state.selectedPythonVersion);
+      await _loadCounts();
+      _showSuccess('已设置默认 Python 版本');
+    } catch (error) {
+      _showError(_extractError(error, '设置默认 Python 版本失败'));
+    }
+  }
+
+  Future<void> _handleCreate() async {
+    final request = await _showCreateDialog();
+    if (request == null) {
+      return;
+    }
+    try {
+      await ref
+          .read(depListProvider.notifier)
+          .create(type: request.type, names: request.names);
+      await _loadCounts();
+      _showSuccess(
+        request.type == 'python'
+            ? '已提交 Python 依赖安装，会同步到可用的 Python 版本'
+            : '已提交 ${request.names.length} 个依赖安装',
+      );
+    } catch (error) {
+      _showError(_extractError(error, '提交安装失败'));
+    }
+  }
+
+  Future<_CreateDepRequest?> _showCreateDialog() async {
+    final namesController = TextEditingController();
+    var createType = ref.read(depListProvider).selectedType;
+    var autoSplit = true;
+
+    return showDialog<_CreateDepRequest>(
+      context: context,
+      useRootNavigator: true,
+      builder: (dialogCtx) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          title: const Text('安装依赖'),
+          content: SizedBox(
+            width: 460,
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  SegmentedButton<String>(
+                    segments: const [
+                      ButtonSegment(value: 'nodejs', label: Text('NodeJS')),
+                      ButtonSegment(value: 'python', label: Text('Python')),
+                      ButtonSegment(value: 'linux', label: Text('Linux')),
+                    ],
+                    selected: {createType},
+                    onSelectionChanged: (selection) {
+                      setDialogState(() => createType = selection.first);
+                    },
+                  ),
+                  if (createType == 'python') ...[
+                    const SizedBox(height: 12),
+                    const _PythonInstallHint(),
+                  ],
+                  const SizedBox(height: 16),
+                  TextField(
+                    controller: namesController,
+                    minLines: 4,
+                    maxLines: 6,
+                    decoration: const InputDecoration(
+                      labelText: '依赖名称',
+                      hintText: '每行一个依赖名称，支持换行、空格、逗号自动拆分',
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('自动拆分'),
+                    subtitle: const Text('开启后按换行、空格、逗号拆分为多个依赖'),
+                    value: autoSplit,
+                    onChanged: (value) {
+                      setDialogState(() => autoSplit = value);
+                    },
+                  ),
+                ],
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogCtx).pop(),
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              onPressed: () {
+                final names = _parseNames(namesController.text, autoSplit);
+                if (names.isEmpty) {
+                  // 校验没过，不是请求出错，所以是 warn 不是 error。
+                  // 走页面自己的 _showWarning 而不是这层 builder 的 context：
+                  // builder 的参数也叫 context，会遮蔽 State.context，而全 App
+                  // 只有 MaterialApp 建的那一个 ScaffoldMessenger，页面 context
+                  // 解析到的正是原先提前取的那个 messenger 实例。
+                  _showWarning('请输入依赖名称');
+                  return;
+                }
+                Navigator.of(
+                  dialogCtx,
+                ).pop(_CreateDepRequest(type: createType, names: names));
+              },
+              child: const Text('安装'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _handleBatchDelete() async {
+    if (_selectedIds.isEmpty) {
+      return;
+    }
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogCtx) => AlertDialog(
+        title: const Text('批量卸载'),
+        content: Text('确定要批量卸载选中的 ${_selectedIds.length} 个依赖吗？'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogCtx, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogCtx, true),
+            style: FilledButton.styleFrom(backgroundColor: AppColors.red500),
+            child: const Text('批量卸载'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) {
+      return;
+    }
+
+    try {
+      await ref
+          .read(depListProvider.notifier)
+          .batchDelete(_selectedIds.toList());
+      await _loadCounts();
+      if (!mounted) {
+        return;
+      }
+      setState(() => _selectedIds.clear());
+      _showSuccess('批量卸载已提交');
+    } catch (error) {
+      _showError(_extractError(error, '批量卸载失败'));
+    }
+  }
+
+  Future<void> _confirmDelete(Dependency dep, {bool force = false}) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogCtx) => AlertDialog(
+        title: Text(force ? '强制卸载依赖' : '卸载依赖'),
+        content: Text(
+          force
+              ? '确定要强制卸载「${dep.name}」吗？这会跳过依赖检查直接删除。'
+              : '确定要卸载「${dep.name}」吗？',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogCtx, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogCtx, true),
+            style: FilledButton.styleFrom(backgroundColor: AppColors.red500),
+            child: Text(force ? '强制卸载' : '卸载'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) {
+      return;
+    }
+
+    try {
+      await ref.read(depListProvider.notifier).delete(dep.id, force: force);
+      await _loadCounts();
+      _showSuccess(force ? '强制卸载中' : '卸载中');
+    } catch (error) {
+      _showError(_extractError(error, force ? '强制卸载失败' : '卸载失败'));
+    }
+  }
+
+  Future<void> _handleReinstall(Dependency dep) async {
+    try {
+      await ref.read(depListProvider.notifier).reinstall(dep.id);
+      await _loadCounts();
+      _showSuccess('重新安装中');
+    } catch (error) {
+      _showError(_extractError(error, '重新安装失败'));
+    }
+  }
+
+  Future<void> _handleCancel(Dependency dep) async {
+    try {
+      await ref.read(depListProvider.notifier).cancel(dep.id);
+      await _loadCounts();
+      _showSuccess('取消请求已提交');
+    } catch (error) {
+      _showError(_extractError(error, '取消失败'));
+    }
+  }
+
+  // ⚠️ 镜像源候选清单（这里的 Linux 三档，加上 _showMirrorDialog 里 pip / npm 两个 Wrap）
+  // 是面板 web/src/views/deps/index.vue 的**手写副本**，顺序与文案逐项对齐。面板不下发这份清单
+  // （spec/frontend/panel-contract.md「镜像源预设列表」），面板改候选或换默认源时这里要跟着改。
+  // 「(默认)」陈述的是面板后端的事实（DefaultPipMirror / defaultLinuxMirror，v3.3.2 起是腾讯云）；
+  // 「恢复默认」是空串 —— 清空后由面板落到它自己的默认源，APP 不需要知道默认是谁。
+  // 天翼云：Debian / Ubuntu / pip 已实测可用（#150）；天翼云没有 Alpine 镜像，apk 档不要加。
+  List<MapEntry<String, String>> _linuxMirrorOptions(DepMirrorConfig config) {
+    if (config.linuxPackageManager == 'apk') {
+      return const [
+        MapEntry('阿里云', 'https://mirrors.aliyun.com/alpine'),
+        MapEntry('清华大学', 'https://mirrors.tuna.tsinghua.edu.cn/alpine'),
+        MapEntry('腾讯云 (默认)', 'https://mirrors.cloud.tencent.com/alpine'),
+        MapEntry('华为云', 'https://repo.huaweicloud.com/alpine'),
+        MapEntry('中科大', 'https://mirrors.ustc.edu.cn/alpine'),
+        MapEntry('恢复默认', ''),
+      ];
+    }
+    if (config.linuxPackageManager == 'apt') {
+      if (config.linuxDistribution == 'debian') {
+        return const [
+          MapEntry('阿里云 Debian', 'https://mirrors.aliyun.com/debian'),
+          MapEntry(
+            '清华大学 Debian',
+            'https://mirrors.tuna.tsinghua.edu.cn/debian',
+          ),
+          MapEntry(
+            '腾讯云 Debian (默认)',
+            'https://mirrors.cloud.tencent.com/debian',
+          ),
+          MapEntry('华为云 Debian', 'https://repo.huaweicloud.com/debian'),
+          MapEntry('天翼云 Debian', 'https://mirrors.ctyun.cn/debian'),
+          MapEntry('恢复默认', ''),
+        ];
+      }
+      return const [
+        MapEntry('阿里云 Ubuntu', 'https://mirrors.aliyun.com/ubuntu'),
+        MapEntry('清华大学 Ubuntu', 'https://mirrors.tuna.tsinghua.edu.cn/ubuntu'),
+        MapEntry(
+          '腾讯云 Ubuntu (默认)',
+          'https://mirrors.cloud.tencent.com/ubuntu',
+        ),
+        MapEntry('华为云 Ubuntu', 'https://repo.huaweicloud.com/ubuntu'),
+        MapEntry('天翼云 Ubuntu', 'https://mirrors.ctyun.cn/ubuntu'),
+        MapEntry('恢复默认', ''),
+      ];
+    }
+    // 不支持的包管理器（dnf / yum / zypper 等）不给任何快捷项，连「恢复默认」也不给：
+    // 输入框本来就是禁用的，与面板「快捷选择」整体禁用一致。
+    return const [];
+  }
+
+  Future<void> _openMirrorDialog() async {
+    setState(() => _mirrorLoading = true);
+    try {
+      final config = await ref.read(depListProvider.notifier).getMirrors();
+      if (!mounted) {
+        return;
+      }
+      final nextConfig = await _showMirrorDialog(config);
+      if (nextConfig == null) {
+        return;
+      }
+      // 只提交改过的字段，理由见 DepMirrorConfig.changedRequestJson。
+      final payload = nextConfig.changedRequestJson(config);
+      if (payload.isEmpty) {
+        // 与网页端一致：什么都没改就不发请求。
+        if (mounted) {
+          AppSnack.show(context, '镜像源未变更');
+        }
+        return;
+      }
+      // 只有 Linux 源真的被改了才拦：以前按「值非空」判，拦不住回填的空串，
+      // 空串照样提交上去，dnf / yum 系统上面板回 400。
+      if (!nextConfig.linuxMirrorSupported &&
+          payload.containsKey('linux_mirror')) {
+        // 系统不支持而不是保存出错，用警告而不是失败。
+        _showWarning(
+          nextConfig.linuxMirrorMessage.isNotEmpty
+              ? nextConfig.linuxMirrorMessage
+              : '当前系统暂不支持 Linux 镜像设置',
+        );
+        return;
+      }
+      if (mounted) {
+        setState(() => _mirrorSaving = true);
+      }
+      try {
+        await ref.read(depListProvider.notifier).setMirrors(payload);
+        _showSuccess('镜像源设置成功');
+      } catch (error) {
+        _showError(_extractError(error, '镜像源设置失败'));
+      } finally {
+        if (mounted) {
+          setState(() => _mirrorSaving = false);
+        }
+      }
+    } catch (error) {
+      _showError(_extractError(error, '获取镜像源配置失败'));
+    } finally {
+      if (mounted) {
+        setState(() => _mirrorLoading = false);
+      }
+    }
+  }
+
+  Future<DepMirrorConfig?> _showMirrorDialog(DepMirrorConfig initial) async {
+    final pipController = TextEditingController(text: initial.pipMirror);
+    final npmController = TextEditingController(text: initial.npmMirror);
+    final linuxController = TextEditingController(text: initial.linuxMirror);
+
+    return showDialog<DepMirrorConfig>(
+      context: context,
+      builder: (dialogCtx) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          title: const Text('镜像源设置'),
+          content: SizedBox(
+            width: 520,
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  TextField(
+                    controller: pipController,
+                    decoration: const InputDecoration(
+                      labelText: 'Python (pip)',
+                      hintText: '留空恢复默认加速源',
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  // pip / npm 这两份候选同样是面板 index.vue 的手写副本，说明见 _linuxMirrorOptions。
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children:
+                        const [
+                          MapEntry(
+                            '阿里云',
+                            'https://mirrors.aliyun.com/pypi/simple',
+                          ),
+                          MapEntry(
+                            '清华大学',
+                            'https://pypi.tuna.tsinghua.edu.cn/simple',
+                          ),
+                          MapEntry('豆瓣', 'https://pypi.doubanio.com/simple'),
+                          MapEntry(
+                            '腾讯云 (默认)',
+                            'https://mirrors.cloud.tencent.com/pypi/simple',
+                          ),
+                          MapEntry(
+                            '华为云',
+                            'https://repo.huaweicloud.com/repository/pypi/simple',
+                          ),
+                          MapEntry(
+                            '天翼云',
+                            'https://mirrors.ctyun.cn/pypi/simple',
+                          ),
+                          // 面板 #165：v3.3.9 起面板不再把官方源换成默认加速源，给个直达选项（海外机器直连更快）。
+                          // 老面板保存后仍会回落腾讯云，那是面板侧的行为，APP 不做版本判断。
+                          MapEntry('PyPI 官方', 'https://pypi.org/simple'),
+                          MapEntry('恢复默认', ''),
+                        ].map((entry) {
+                          return ActionChip(
+                            label: Text(entry.key),
+                            onPressed: () {
+                              setDialogState(
+                                () => pipController.text = entry.value,
+                              );
+                            },
+                          );
+                        }).toList(),
+                  ),
+                  const SizedBox(height: 14),
+                  TextField(
+                    controller: npmController,
+                    decoration: const InputDecoration(
+                      labelText: 'Node.js (npm)',
+                      hintText: '留空恢复默认加速源',
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children:
+                        [
+                          ('淘宝 (npmmirror)', 'https://registry.npmmirror.com'),
+                          ('腾讯云', 'https://mirrors.cloud.tencent.com/npm/'),
+                          (
+                            '华为云',
+                            'https://repo.huaweicloud.com/repository/npm/',
+                          ),
+                          // 面板 #165 同一个根因：npm 官方源现在也原样保存、原样生效。
+                          ('npm 官方', 'https://registry.npmjs.org/'),
+                          ('恢复默认', ''),
+                        ].map((entry) {
+                          return ActionChip(
+                            label: Text(entry.$1),
+                            onPressed: () {
+                              setDialogState(
+                                () => npmController.text = entry.$2,
+                              );
+                            },
+                          );
+                        }).toList(),
+                  ),
+                  const SizedBox(height: 14),
+                  TextField(
+                    controller: linuxController,
+                    enabled: initial.linuxMirrorSupported,
+                    decoration: InputDecoration(
+                      labelText: initial.linuxMirrorLabel,
+                      hintText: initial.linuxMirrorSupported
+                          ? '留空恢复默认加速源'
+                          : '当前包管理器暂不支持镜像设置',
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: _linuxMirrorOptions(initial).map((entry) {
+                      return ActionChip(
+                        label: Text(entry.key),
+                        onPressed: initial.linuxMirrorSupported
+                            ? () {
+                                setDialogState(
+                                  () => linuxController.text = entry.value,
+                                );
+                              }
+                            : null,
+                      );
+                    }).toList(),
+                  ),
+                  const SizedBox(height: 12),
+                  AppNotice(
+                    color: AppColors.blue500,
+                    text:
+                        '当前检测：${initial.linuxPackageManager.isEmpty ? '未识别' : initial.linuxPackageManager}'
+                        '${initial.linuxDistribution.isEmpty ? '' : ' / ${initial.linuxDistribution}'}'
+                        '${initial.linuxMirrorMessage.isEmpty ? '' : '。${initial.linuxMirrorMessage}'}',
+                  ),
+                ],
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogCtx),
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              onPressed: () {
+                Navigator.pop(
+                  dialogCtx,
+                  initial.copyWith(
+                    pipMirror: pipController.text.trim(),
+                    npmMirror: npmController.text.trim(),
+                    linuxMirror: linuxController.text.trim(),
+                  ),
+                );
+              },
+              child: const Text('保存'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildCountCard(
+    String type,
+    String label,
+    bool selected,
+    bool isLight,
+  ) {
+    final count = _counts[type] ?? 0;
+    return AppCard(
+      onTap: () => _changeType(type),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+      // 选中态是淡底 + 实色边，必须显式传入，否则会落回 AppCard 的默认卡片配色。
+      color: selected ? AppColors.primary.withAlpha(isLight ? 18 : 24) : null,
+      borderColor: selected ? AppColors.primary : null,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            label,
+            style: TextStyle(
+              fontSize: 12,
+              color: selected
+                  ? AppColors.primaryDark
+                  : (isLight ? AppColors.slate500 : AppColors.slate400),
+            ),
+          ),
+          const SizedBox(height: 6),
+          Text(
+            _countLoading ? '--' : '$count',
+            style: TextStyle(
+              fontSize: 22,
+              fontWeight: FontWeight.w800,
+              color: selected
+                  ? AppColors.primary
+                  : (isLight ? AppColors.slate900 : AppColors.slate50),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildPythonRuntimePanel(DepListState state, bool isLight) {
+    final runtimes = state.pythonRuntimes;
+    final hasSelected = runtimes.any(
+      (runtime) => runtime.version == state.selectedPythonVersion,
+    );
+    final selectedVersion = hasSelected
+        ? state.selectedPythonVersion
+        : (runtimes.isNotEmpty ? runtimes.first.version : null);
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 20),
+      child: AppCard(
+        width: double.infinity,
+        padding: const EdgeInsets.all(AppSpacing.md),
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            final isNarrow = constraints.maxWidth < 420;
+            return Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                if (isNarrow) ...[
+                  DropdownButtonFormField<String>(
+                    key: ValueKey(selectedVersion),
+                    initialValue: selectedVersion,
+                    // APP #23 ① 顺带：窄屏 + 大字号时「Python 3.12（默认）」比下拉框宽，
+                    // 不展开就会横向溢出；展开后文字在框内单行省略。
+                    isExpanded: true,
+                    decoration: const InputDecoration(
+                      labelText: 'Python 版本',
+                      isDense: true,
+                    ),
+                    items: runtimes.map((runtime) {
+                      final suffix = runtime.isDefault ? '（默认）' : '';
+                      return DropdownMenuItem(
+                        value: runtime.version,
+                        child: Text(
+                          '${runtime.label}$suffix',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      );
+                    }).toList(),
+                    onChanged: state.runtimeLoading
+                        ? null
+                        : (value) {
+                            if (value != null) _changePythonVersion(value);
+                          },
+                  ),
+                  const SizedBox(height: 10),
+                  SizedBox(
+                    width: double.infinity,
+                    child: OutlinedButton(
+                      onPressed:
+                          state.selectedPythonVersion ==
+                              state.pythonDefaultVersion
+                          ? null
+                          : _setPythonDefault,
+                      child: const Text('设为默认'),
+                    ),
+                  ),
+                ] else
+                  Row(
+                    children: [
+                      Expanded(
+                        child: DropdownButtonFormField<String>(
+                          key: ValueKey(selectedVersion),
+                          initialValue: selectedVersion,
+                          // 同上：大字号时文字比下拉框宽也只在框内省略。
+                          isExpanded: true,
+                          decoration: const InputDecoration(
+                            labelText: 'Python 版本',
+                            isDense: true,
+                          ),
+                          items: runtimes.map((runtime) {
+                            final suffix = runtime.isDefault ? '（默认）' : '';
+                            return DropdownMenuItem(
+                              value: runtime.version,
+                              child: Text(
+                                '${runtime.label}$suffix',
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            );
+                          }).toList(),
+                          onChanged: state.runtimeLoading
+                              ? null
+                              : (value) {
+                                  if (value != null) {
+                                    _changePythonVersion(value);
+                                  }
+                                },
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      OutlinedButton(
+                        onPressed:
+                            state.selectedPythonVersion ==
+                                state.pythonDefaultVersion
+                            ? null
+                            : _setPythonDefault,
+                        child: const Text('设为默认'),
+                      ),
+                    ],
+                  ),
+                const SizedBox(height: 10),
+                const _PythonInstallHint(),
+                const SizedBox(height: 10),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: runtimes.isEmpty
+                      ? [
+                          Text(
+                            state.runtimeLoading
+                                ? '正在加载 Python 运行时...'
+                                : '暂无运行时信息',
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: isLight
+                                  ? AppColors.slate500
+                                  : AppColors.slate400,
+                            ),
+                          ),
+                        ]
+                      : runtimes.map((runtime) {
+                          // 「可用」是健康态，属 success 绿；primary 不表达可用。
+                          // 这一个变量同时驱动淡底、描边和 tintFg 前景，改一处即可。
+                          final color = runtime.available
+                              ? AppColors.success
+                              : AppColors.amber500;
+                          return Tooltip(
+                            message: runtime.message,
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 8,
+                                vertical: 4,
+                              ),
+                              decoration: BoxDecoration(
+                                color: color.withAlpha(18),
+                                borderRadius: BorderRadius.circular(
+                                  AppRadius.pill,
+                                ),
+                                border: Border.all(color: color.withAlpha(60)),
+                              ),
+                              child: Text(
+                                '${runtime.label}：${runtime.available ? '可用' : '需安装'}',
+                                style: TextStyle(
+                                  fontSize: 11,
+                                  fontWeight: FontWeight.w600,
+                                  // 「需安装」用的是 amber，压在自己的淡底上
+                                  // 只有 2.04:1，是这一批里最看不清的。
+                                  color: context.surfaces.tintFg(color),
+                                ),
+                              ),
+                            ),
+                          );
+                        }).toList(),
+                ),
+              ],
+            );
+          },
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final state = ref.watch(depListProvider);
+    final theme = Theme.of(context);
+    final isLight = theme.brightness == Brightness.light;
+    // APP #23 ①：计数卡、Python 运行时面板、状态筛选原来都钉在列表上方，
+    // 360dp 屏看 Python 依赖时列表只剩小半屏。现在只固定标题行（和有选中项时的「批量卸载」），
+    // 这一段作为列表的第一项，向上滑就跟着滚走；加载 / 出错 / 空态的列表也都带着它，切类型、筛状态照常可用。
+    final listHeader = Column(
+      children: [
+        const SizedBox(height: 14),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 20),
+          child: LayoutBuilder(
+            builder: (context, constraints) {
+              // 窄屏也一行三个（原来宽度 < 420 时一行两个，Linux 单独占一行）。
+              final width = (constraints.maxWidth - 20) / 3;
+              return Wrap(
+                spacing: 10,
+                runSpacing: 10,
+                children: [
+                  SizedBox(
+                    width: width,
+                    child: _buildCountCard(
+                      'nodejs',
+                      'NodeJS',
+                      state.selectedType == 'nodejs',
+                      isLight,
+                    ),
+                  ),
+                  SizedBox(
+                    width: width,
+                    child: _buildCountCard(
+                      'python',
+                      'Python',
+                      state.selectedType == 'python',
+                      isLight,
+                    ),
+                  ),
+                  SizedBox(
+                    width: width,
+                    child: _buildCountCard(
+                      'linux',
+                      'Linux',
+                      state.selectedType == 'linux',
+                      isLight,
+                    ),
+                  ),
+                ],
+              );
+            },
+          ),
+        ),
+        const SizedBox(height: 10),
+        if (state.selectedType == 'python') ...[
+          _buildPythonRuntimePanel(state, isLight),
+          const SizedBox(height: 10),
+        ],
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 20),
+          child: Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              _StatusFilterChip(
+                label: '全部',
+                count: state.items.length,
+                selected: _statusFilter == null,
+                isLight: isLight,
+                onTap: () => setState(() => _statusFilter = null),
+              ),
+              _StatusFilterChip(
+                label: '已安装',
+                count: state.items.where((d) => d.isInstalled).length,
+                selected: _statusFilter == 'installed',
+                isLight: isLight,
+                // 与下方「已安装」状态徽章同色；原先是 primary，
+                // 和默认也是 primary 的「全部」chip 完全同色。
+                color: AppColors.success,
+                onTap: () => setState(
+                  () => _statusFilter = _statusFilter == 'installed'
+                      ? null
+                      : 'installed',
+                ),
+              ),
+              _StatusFilterChip(
+                label: '失败',
+                count: state.items.where((d) => d.isFailed).length,
+                selected: _statusFilter == 'failed',
+                isLight: isLight,
+                color: AppColors.danger,
+                onTap: () => setState(
+                  () => _statusFilter = _statusFilter == 'failed'
+                      ? null
+                      : 'failed',
+                ),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 10),
+      ],
+    );
+
+    return Scaffold(
+      body: Padding(
+        padding: EdgeInsets.only(top: MediaQuery.of(context).padding.top + 12),
+        child: Column(
+          children: [
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 20),
+              child: Row(
+                children: [
+                  const AppBackButton(),
+                  const SizedBox(width: 8),
+                  const Expanded(
+                    child: Text(
+                      '依赖管理',
+                      style: TextStyle(
+                        fontSize: 24,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
+                  IconButton(
+                    tooltip: '镜像源设置',
+                    onPressed: _mirrorLoading || _mirrorSaving
+                        ? null
+                        : _openMirrorDialog,
+                    icon: _mirrorLoading || _mirrorSaving
+                        ? const SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.settings_suggest_outlined),
+                  ),
+                  AppCircleAddButton(onTap: _handleCreate),
+                ],
+              ),
+            ),
+            // 「批量卸载」不放进随列表滚走的头部：用户是往下滑着勾选的，
+            // 按钮跟着滚出屏幕就得再滑回顶部才能点。有选中项时钉在标题行下方，没选中时不占位。
+            if (_selectedIds.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 20),
+                child: FilledButton.tonalIcon(
+                  onPressed: _handleBatchDelete,
+                  icon: const Icon(Icons.delete_sweep_outlined, size: 18),
+                  label: Text('批量卸载 (${_selectedIds.length})'),
+                  style: FilledButton.styleFrom(
+                    foregroundColor: AppColors.red500,
+                    minimumSize: const Size(double.infinity, 40),
+                  ),
+                ),
+              ),
+            ],
+            Expanded(
+              child: RefreshIndicator(
+                color: AppColors.primary,
+                onRefresh: _loadPageData,
+                child: state.loading && state.items.isEmpty
+                    ? ListView(
+                        physics: const AlwaysScrollableScrollPhysics(),
+                        children: [
+                          listHeader,
+                          const SizedBox(height: 120),
+                          const Center(
+                            child: CircularProgressIndicator(
+                              color: AppColors.primary,
+                            ),
+                          ),
+                        ],
+                      )
+                    // 拿不到依赖和当前类型下真的没有依赖是两回事，
+                    // 必须先判 error，否则断网时用户看到的是「暂无 XX 依赖」。
+                    : state.error != null && state.items.isEmpty
+                    ? ListView(
+                        physics: const AlwaysScrollableScrollPhysics(),
+                        children: [
+                          listHeader,
+                          AppErrorView(
+                            title: '依赖加载失败',
+                            message: state.error!,
+                            onRetry: _loadPageData,
+                          ),
+                        ],
+                      )
+                    : () {
+                        final filtered = _statusFilter == null
+                            ? state.items
+                            : state.items
+                                  .where((d) => d.status == _statusFilter)
+                                  .toList();
+                        if (filtered.isEmpty) {
+                          return ListView(
+                            physics: const AlwaysScrollableScrollPhysics(),
+                            children: [
+                              listHeader,
+                              const SizedBox(height: 100),
+                              Icon(
+                                Icons.inventory_2_outlined,
+                                size: 56,
+                                color: AppColors.slate400.withAlpha(120),
+                              ),
+                              const SizedBox(height: 12),
+                              Center(
+                                child: Text(
+                                  _statusFilter != null
+                                      ? '没有${_statusFilter == 'installed' ? '已安装' : '失败'}的依赖'
+                                      : '暂无${_typeLabel(state.selectedType)}依赖',
+                                  style: const TextStyle(
+                                    color: AppColors.slate400,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          );
+                        }
+                        // 第 0 项是上面那段可滚走的头部，依赖卡片从第 1 项开始。
+                        return ListView.builder(
+                          physics: const AlwaysScrollableScrollPhysics(),
+                          padding: const EdgeInsets.only(bottom: 24),
+                          itemCount: filtered.length + 1,
+                          itemBuilder: (_, i) {
+                            if (i == 0) {
+                              return listHeader;
+                            }
+                            final dep = filtered[i - 1];
+                            return Padding(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 20,
+                              ),
+                              child: _DepCard(
+                                dep: dep,
+                                isLight: isLight,
+                                selected: _selectedIds.contains(dep.id),
+                                subtitle:
+                                    '${_typeLabel(dep.type)}'
+                                    '${dep.type == 'python' && dep.pythonVersion.isNotEmpty ? ' ${dep.pythonVersion}' : ''}'
+                                    ' · ${formatTimeCn(dep.createdAt, short: true)}',
+                                onSelected: (value) {
+                                  setState(() {
+                                    if (value) {
+                                      _selectedIds.add(dep.id);
+                                    } else {
+                                      _selectedIds.remove(dep.id);
+                                    }
+                                  });
+                                },
+                                onViewLog: () =>
+                                    context.push('/deps/${dep.id}/log-stream'),
+                                onCancel: dep.isBusy
+                                    ? () => _handleCancel(dep)
+                                    : null,
+                                onReinstall: dep.isBusy
+                                    ? null
+                                    : () => _handleReinstall(dep),
+                                onDelete: dep.isBusy
+                                    ? null
+                                    : () => _confirmDelete(dep),
+                                onForceDelete: dep.isBusy
+                                    ? null
+                                    : () => _confirmDelete(dep, force: true),
+                              ),
+                            );
+                          },
+                        );
+                      }(),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ── Card ──
+
+class _DepCard extends StatelessWidget {
+  final Dependency dep;
+  final bool isLight;
+  final bool selected;
+  final String subtitle;
+  final ValueChanged<bool> onSelected;
+  final VoidCallback onViewLog;
+  final VoidCallback? onCancel;
+  final VoidCallback? onReinstall;
+  final VoidCallback? onDelete;
+  final VoidCallback? onForceDelete;
+
+  const _DepCard({
+    required this.dep,
+    required this.isLight,
+    required this.selected,
+    required this.subtitle,
+    required this.onSelected,
+    required this.onViewLog,
+    required this.onCancel,
+    required this.onReinstall,
+    required this.onDelete,
+    required this.onForceDelete,
+  });
+
+  // 安装中/排队中=蓝(info)、失败=红(danger)、已取消/未知=灰、已安装=绿(success)。
+  // 「已安装」原先借用 primary 淡底 + 写死的 Emerald 深绿字，主色换蓝后就成了
+  // 深绿字配浅蓝底，这里换成成套的 success 色。
+  //
+  // 「未知」这一档是本次补的：改动前最后一个分支是绿色，等价于
+  // 「凡是我不认识的依赖状态，一律画成已安装」。徽章文字已经改成显示原始状态
+  // 了，颜色再不跟上，用户看到的仍是一个绿色的成功态。
+  Color _statusBg() {
+    switch (dep.statusTone) {
+      case PanelStatusTone.running:
+        return isLight ? AppColors.infoLight : AppColors.info.withAlpha(25);
+      case PanelStatusTone.danger:
+        return isLight ? AppColors.dangerLight : AppColors.danger.withAlpha(25);
+      case PanelStatusTone.success:
+        return isLight
+            ? AppColors.successLight
+            : AppColors.success.withAlpha(25);
+      case PanelStatusTone.warning:
+        return AppColors.warning.withAlpha(isLight ? 18 : 25);
+      case PanelStatusTone.neutral:
+        return isLight ? AppColors.slate100 : AppColors.slate700;
+    }
+  }
+
+  Color _statusFg() {
+    switch (dep.statusTone) {
+      case PanelStatusTone.running:
+        return isLight ? AppColors.infoDark : AppColors.info;
+      case PanelStatusTone.danger:
+        return isLight ? AppColors.dangerDark : AppColors.danger;
+      case PanelStatusTone.success:
+        return isLight ? AppColors.successDark : AppColors.success;
+      case PanelStatusTone.warning:
+        return (isLight ? AppSurfaces.light : AppSurfaces.dark)
+            .tintFg(AppColors.warning);
+      case PanelStatusTone.neutral:
+        return isLight ? AppColors.slate600 : AppColors.slate300;
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // 这张卡已经贴着地板：78dp 里有 48dp 是右侧 PopupMenuButton 的点击区，
+    // 那 48dp 一动不能动。可削的只有内边距与外边距，合计 −10dp 到头了。
+    return AppCard(
+      margin: const EdgeInsets.only(bottom: 6),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+      // 勾选框被 SizedBox 压到 24dp，远低于可用的最小命中区。
+      // 这里不去撑大它——上面那段注释说了这张卡的高度已经没有余量。
+      // 改成整卡可点（任务页与环境变量页的卡本来就是这么做的），
+      // 勾选框仍是 24dp 的视觉尺寸，但用户点卡片任意位置都能选中。
+      onTap: () => onSelected(!selected),
+      child: Row(
+        children: [
+          SizedBox(
+            width: 24,
+            height: 24,
+            child: Checkbox(
+              value: selected,
+              onChanged: (value) => onSelected(value ?? false),
+              visualDensity: VisualDensity.compact,
+              materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        dep.name,
+                        style: const TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w600,
+                        ),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                    if (dep.version.isNotEmpty)
+                      Text(
+                        dep.version,
+                        style: TextStyle(
+                          fontSize: 10,
+                          color: isLight
+                              ? AppColors.slate500
+                              : AppColors.slate400,
+                          fontFamily: 'monospace',
+                        ),
+                      ),
+                  ],
+                ),
+                const SizedBox(height: 3),
+                Row(
+                  children: [
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 6,
+                        vertical: 1,
+                      ),
+                      decoration: BoxDecoration(
+                        color: _statusBg(),
+                        // 9px 微徽章。原值 4，全库这一类共 6 处统一走 sm。
+                        borderRadius: BorderRadius.circular(AppRadius.sm),
+                      ),
+                      child: Text(
+                        dep.statusText,
+                        style: TextStyle(
+                          fontSize: 9,
+                          fontWeight: FontWeight.w700,
+                          color: _statusFg(),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        subtitle,
+                        style: TextStyle(
+                          fontSize: 10,
+                          color: isLight
+                              ? AppColors.slate400
+                              : AppColors.slate500,
+                        ),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 4),
+          IconButton(
+            onPressed: onViewLog,
+            icon: const Icon(Icons.terminal, size: 18),
+            tooltip: '日志',
+            visualDensity: VisualDensity.compact,
+            constraints: const BoxConstraints(
+              minWidth: AppTapTarget.min,
+              minHeight: AppTapTarget.min,
+            ),
+          ),
+          PopupMenuButton<String>(
+            onSelected: (action) {
+              switch (action) {
+                case 'cancel':
+                  onCancel?.call();
+                case 'reinstall':
+                  onReinstall?.call();
+                case 'delete':
+                  onDelete?.call();
+                case 'force_delete':
+                  onForceDelete?.call();
+              }
+            },
+            icon: const Icon(Icons.more_horiz, size: 18),
+            itemBuilder: (_) => [
+              if (dep.isBusy)
+                const PopupMenuItem(value: 'cancel', child: Text('取消安装')),
+              if (!dep.isBusy)
+                const PopupMenuItem(value: 'reinstall', child: Text('重新安装')),
+              if (!dep.isBusy)
+                const PopupMenuItem(value: 'delete', child: Text('卸载')),
+              if (!dep.isBusy)
+                PopupMenuItem(
+                  value: 'force_delete',
+                  child: Text(
+                    '强制卸载',
+                    style: TextStyle(color: AppColors.red500),
+                  ),
+                ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ── Dep Log Stream Page ──
+
+class DepLogStreamPage extends ConsumerStatefulWidget {
+  final int depId;
+  const DepLogStreamPage({super.key, required this.depId});
+
+  @override
+  ConsumerState<DepLogStreamPage> createState() => _DepLogStreamPageState();
+}
+
+class _DepLogStreamPageState extends ConsumerState<DepLogStreamPage> {
+  final _sseClient = SseClient();
+  final _logs = <String>[];
+  final _scrollController = ScrollController();
+  bool _done = false;
+
+  /// 连接失败的原因。之前失败也只是把 _done 置 true，
+  /// 于是断线和「装完了」显示的都是同一条绿色「安装完成」banner —— 是假的成功。
+  String? _errorMessage;
+  Color? _logBackgroundColor;
+
+  @override
+  void initState() {
+    super.initState();
+    Future.microtask(() async {
+      final color = await loadPanelLogBackgroundColor();
+      if (mounted) {
+        setState(() => _logBackgroundColor = color);
+      }
+    });
+    _sseClient.connect(
+      path: ApiEndpoints.depLogStream(widget.depId),
+      autoReconnect: true,
+      onEvent: (event) {
+        if (!mounted) return;
+        setState(() {
+          _logs.add(event.data);
+          if (event.event == 'done' && event.data != 'reconnect') {
+            _done = true;
+          }
+        });
+        Future.delayed(const Duration(milliseconds: 50), () {
+          if (_scrollController.hasClients) {
+            _scrollController.jumpTo(
+              _scrollController.position.maxScrollExtent,
+            );
+          }
+        });
+      },
+      onDone: () {
+        if (mounted) setState(() => _done = true);
+      },
+      onError: (error) {
+        if (!mounted) return;
+        setState(() {
+          _done = true;
+          _errorMessage = error is SseAuthFailure
+              ? error.message
+              : '安装日志连接已断开';
+        });
+      },
+    );
+  }
+
+  @override
+  void dispose() {
+    _sseClient.close();
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final logTheme = resolveLogSurfaceTheme(
+      _logBackgroundColor,
+      themeBrightness: Theme.of(context).brightness,
+    );
+    final doneBannerBackground = logTheme.brightness == Brightness.dark
+        ? AppColors.slate800
+        : AppColors.slate100;
+
+    return Scaffold(
+      backgroundColor: logTheme.background,
+      appBar: AppBar(
+        title: const Text('安装日志'),
+        backgroundColor: logTheme.background,
+        foregroundColor: logTheme.foreground,
+      ),
+      body: Container(
+        color: logTheme.background,
+        child: Column(
+          children: [
+            Expanded(
+              child: ListView.builder(
+                controller: _scrollController,
+                padding: const EdgeInsets.all(12),
+                itemCount: _logs.length,
+                itemBuilder: (_, i) => SelectionArea(
+                  child: RichText(
+                    text: AnsiTextParser.buildTextSpan(
+                      _logs[i],
+                      baseStyle: TextStyle(
+                        color: logTheme.foreground,
+                        fontFamily: 'monospace',
+                        fontSize: 12,
+                        height: 1.6,
+                      ),
+                      brightness: logTheme.brightness,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            if (_errorMessage != null)
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(12),
+                color: doneBannerBackground,
+                child: Text(
+                  _errorMessage!,
+                  textAlign: TextAlign.center,
+                  // 断线不是成功，不能复用绿色 banner。浅色分支取 dangerDark，
+                  // 理由与下面的 successDark 一样：banner 底是 slate100。
+                  style: TextStyle(
+                    color: logTheme.brightness == Brightness.dark
+                        ? AppColors.danger
+                        : AppColors.dangerDark,
+                    fontSize: 13,
+                  ),
+                ),
+              )
+            else if (_done)
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(12),
+                color: doneBannerBackground,
+                child: Text(
+                  '安装完成',
+                  textAlign: TextAlign.center,
+                  // 「完成」是结果成功，走 success；与列表卡「已安装」徽章同族。
+                  // 浅色分支取 successDark：banner 底是 slate100，
+                  // 满强度 success 只有 2.1:1。深色分支沿用日志前景色，不动。
+                  style: TextStyle(
+                    color: logTheme.brightness == Brightness.dark
+                        ? logTheme.foreground
+                        : AppColors.successDark,
+                    fontSize: 13,
+                  ),
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _StatusFilterChip extends StatelessWidget {
+  final String label;
+  final int count;
+  final bool selected;
+  final bool isLight;
+  final Color? color;
+  final VoidCallback onTap;
+
+  const _StatusFilterChip({
+    required this.label,
+    required this.count,
+    required this.selected,
+    required this.isLight,
+    this.color,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final activeColor = color ?? AppColors.primary;
+    final bg = selected
+        ? activeColor.withAlpha(20)
+        : (isLight ? AppColors.slate50 : AppColors.slate900);
+    // 选中态底色是 activeColor 的 alpha=20 淡底，标签再用满强度同色就贴在一起了。
+    final fg = selected
+        ? context.surfaces.tintFg(activeColor)
+        : (isLight ? AppColors.slate600 : AppColors.slate400);
+
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+        decoration: BoxDecoration(
+          color: bg,
+          // 零像素变化：这个筛选 chip 高约 31，原写的 20 早就被 clamp 成 15.5 —
+          // 它渲染出来一直是胶囊，这里只是改成诚实的写法。
+          borderRadius: BorderRadius.circular(AppRadius.pill),
+          border: Border.all(
+            color: selected
+                ? activeColor.withAlpha(60)
+                : (isLight ? AppColors.slate200 : AppColors.slate800),
+          ),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
+              label,
+              style: TextStyle(
+                fontSize: 12,
+                fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+                color: fg,
+              ),
+            ),
+            const SizedBox(width: 5),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+              decoration: BoxDecoration(
+                color: selected
+                    ? activeColor
+                    : (isLight ? AppColors.slate200 : AppColors.slate800),
+                // 同上，零像素变化：计数徽章高约 14，原写的 10 被 clamp 成 7。
+                // 它嵌在上面那个 chip 里，两层都是胶囊，内层半径 7 仍远小于
+                // 外层的 15.5，层级关系不会糊。
+                borderRadius: BorderRadius.circular(AppRadius.pill),
+              ),
+              child: Text(
+                '$count',
+                style: TextStyle(
+                  fontSize: 10,
+                  fontWeight: FontWeight.w700,
+                  color: selected ? Colors.white : fg,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _PythonInstallHint extends StatelessWidget {
+  // 明暗差异已经由 AppNotice 内部的 AppSurfaces 解析，不再需要调用方传 isLight。
+  const _PythonInstallHint();
+
+  @override
+  Widget build(BuildContext context) {
+    return const AppNotice(
+      color: AppColors.blue500,
+      text:
+          'Python 多版本说明：二进制部署不会内置三个 Python，只需在服务器安装实际要用的版本；安装 Python 依赖时会同步提交到可用的 Python 3.10、3.11、3.12 环境。',
+    );
+  }
+}

@@ -1,0 +1,1221 @@
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../../../core/network/dio_client.dart';
+import '../../../core/network/api_endpoints.dart';
+import '../../../core/theme/app_theme.dart';
+import '../../../core/theme/design_tokens.dart';
+import '../../../shared/utils/api_utils.dart';
+import '../../../shared/utils/time_utils.dart';
+import '../../../shared/widgets/app_circle_add_button.dart';
+import '../../../shared/widgets/app_back_button.dart';
+import '../../../shared/widgets/app_card.dart';
+import '../../../shared/widgets/app_snack.dart';
+
+class _ApiScopeOption {
+  final String value;
+  final String label;
+  final String description;
+
+  const _ApiScopeOption(this.value, this.label, this.description);
+}
+
+// 必须与面板服务端 middleware.OpenAPIAccess("...") 实际强制的 8 个 scope 一致。
+// 少一项的表现不是报错，而是「这个权限永远勾不上」——建出来的应用调该类接口一律 403，
+// 而界面上完全看不出少了什么。notifications 与 backup 就曾经这样漏了两版。
+// 面板 v3.0.2 起有测试锁住服务端与面板 Web 的一致性，但**管不到这个仓库**，改前请核对。
+const _apiScopeOptions = [
+  _ApiScopeOption('tasks', '任务管理', '读取与操作定时任务'),
+  _ApiScopeOption('scripts', '脚本管理', '访问脚本目录和执行入口'),
+  _ApiScopeOption('envs', '环境变量', '读取和维护环境变量'),
+  _ApiScopeOption('subscriptions', '订阅管理', '管理订阅仓库和文件'),
+  _ApiScopeOption('logs', '日志查看', '读取执行日志和流式输出'),
+  _ApiScopeOption('system', '系统信息', '读取系统信息和状态数据'),
+  _ApiScopeOption('notifications', '通知渠道', '发送通知与管理渠道'),
+  _ApiScopeOption('backup', '系统备份', '创建、下载与恢复备份'),
+];
+
+class OpenApiPage extends ConsumerStatefulWidget {
+  const OpenApiPage({super.key});
+
+  @override
+  ConsumerState<OpenApiPage> createState() => _OpenApiPageState();
+}
+
+class _OpenApiPageState extends ConsumerState<OpenApiPage> {
+  List<Map<String, dynamic>> _apps = [];
+  bool _loading = true;
+
+  String _scopeLabel(String value) {
+    for (final option in _apiScopeOptions) {
+      if (option.value == value) {
+        return option.label;
+      }
+    }
+    return value;
+  }
+
+  List<String> _parseScopes(String scopes) {
+    return scopes
+        .split(',')
+        .map((item) => item.trim())
+        .where((item) => item.isNotEmpty)
+        .toList();
+  }
+
+  String _joinScopes(List<String> scopes) => scopes.join(',');
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    setState(() => _loading = true);
+    try {
+      final resp = await DioClient.instance.dio.get(ApiEndpoints.openApiApps);
+      final data = extractData(resp.data);
+      setState(() {
+        _apps = (data is List)
+            ? data.whereType<Map<String, dynamic>>().toList()
+            : [];
+        _loading = false;
+      });
+    } catch (_) {
+      setState(() => _loading = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final isLight = Theme.of(context).brightness == Brightness.light;
+
+    return Scaffold(
+      body: Padding(
+        padding: EdgeInsets.only(top: MediaQuery.of(context).padding.top + 12),
+        child: Column(
+          children: [
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 20),
+              child: Row(
+                children: [
+                  const AppBackButton(),
+                  const SizedBox(width: 8),
+                  const Expanded(
+                    child: Text(
+                      'Open API',
+                      style: TextStyle(
+                        fontSize: 24,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
+                  AppCircleAddButton(onTap: _showCreateDialog),
+                ],
+              ),
+            ),
+            const SizedBox(height: 16),
+            Expanded(
+              child: RefreshIndicator(
+                color: AppColors.primary,
+                onRefresh: _load,
+                child: _loading && _apps.isEmpty
+                    ? ListView(
+                        physics: const AlwaysScrollableScrollPhysics(),
+                        children: const [
+                          SizedBox(height: 120),
+                          Center(
+                            child: CircularProgressIndicator(
+                              color: AppColors.primary,
+                            ),
+                          ),
+                        ],
+                      )
+                    : _apps.isEmpty
+                    ? ListView(
+                        physics: const AlwaysScrollableScrollPhysics(),
+                        children: [
+                          const SizedBox(height: 100),
+                          Icon(
+                            Icons.api_outlined,
+                            size: 56,
+                            color: AppColors.slate400.withAlpha(120),
+                          ),
+                          const SizedBox(height: 12),
+                          const Center(
+                            child: Text(
+                              '暂无 API 应用',
+                              style: TextStyle(color: AppColors.slate400),
+                            ),
+                          ),
+                        ],
+                      )
+                    : ListView.builder(
+                        padding: const EdgeInsets.fromLTRB(20, 0, 20, 24),
+                        itemCount: _apps.length,
+                        itemBuilder: (_, i) =>
+                            _buildAppCard(app: _apps[i], isLight: isLight),
+                      ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _showCreateDialog() {
+    final nameC = TextEditingController();
+    final rateLimitC = TextEditingController(text: '100');
+    final selectedScopes = <String>{};
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: true,
+      useRootNavigator: true,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setSheetState) {
+          final navigator = Navigator.of(ctx);
+          return Padding(
+            padding: EdgeInsets.fromLTRB(
+              20,
+              0,
+              20,
+              MediaQuery.of(ctx).viewInsets.bottom + 20,
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                const Text(
+                  '创建 API 应用',
+                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                ),
+                const SizedBox(height: 16),
+                TextField(
+                  controller: nameC,
+                  decoration: const InputDecoration(labelText: '应用名称'),
+                ),
+                const SizedBox(height: 12),
+                const Text(
+                  '权限范围',
+                  style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+                ),
+                const SizedBox(height: 8),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: _apiScopeOptions.map((option) {
+                    return FilterChip(
+                      label: Text(option.label),
+                      selected: selectedScopes.contains(option.value),
+                      onSelected: (selected) {
+                        setSheetState(() {
+                          if (selected) {
+                            selectedScopes.add(option.value);
+                          } else {
+                            selectedScopes.remove(option.value);
+                          }
+                        });
+                      },
+                    );
+                  }).toList(),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  '留空表示该应用创建成功，但没有任何接口访问权限。',
+                  style: TextStyle(fontSize: 11, color: AppColors.slate400),
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: rateLimitC,
+                  keyboardType: TextInputType.number,
+                  decoration: const InputDecoration(
+                    labelText: '速率限制（次/小时）',
+                    hintText: '默认 100',
+                  ),
+                ),
+                const SizedBox(height: 20),
+                SizedBox(
+                  height: 44,
+                  child: FilledButton(
+                    onPressed: () async {
+                      if (nameC.text.trim().isEmpty) {
+                        return;
+                      }
+                      try {
+                        final resp = await DioClient.instance.dio.post(
+                          ApiEndpoints.openApiApps,
+                          data: {
+                            'name': nameC.text.trim(),
+                            'scopes': _joinScopes(selectedScopes.toList()),
+                            'rate_limit':
+                                int.tryParse(rateLimitC.text.trim()) ?? 100,
+                          },
+                        );
+                        if (!mounted) {
+                          return;
+                        }
+                        navigator.pop();
+                        await _load();
+                        final data = extractData(resp.data);
+                        if (data is Map && data['app_secret'] != null) {
+                          _showSecretDialog(
+                            data['app_key']?.toString() ?? '',
+                            data['app_secret'].toString(),
+                          );
+                        }
+                      } catch (error) {
+                        if (!mounted) {
+                          return;
+                        }
+                        // 弹窗自己的 ctx 在 pop 之后就失效了，这里一律用 State 的
+                        // context，由上面的 mounted 判断兜住 async gap。
+                        AppSnack.error(
+                          context,
+                          extractErrorMessage(error, '创建 API 应用失败'),
+                        );
+                      }
+                    },
+                    child: const Text('创建'),
+                  ),
+                ),
+                const SizedBox(height: 8),
+                SizedBox(
+                  height: 44,
+                  child: OutlinedButton(
+                    onPressed: () => Navigator.of(ctx).pop(),
+                    child: const Text('取消'),
+                  ),
+                ),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  void _showSecretDialog(String appKey, String appSecret) {
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogCtx) => AlertDialog(
+        title: const Text('应用密钥'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              '请妥善保管以下密钥，关闭后无法再次查看：',
+              style: TextStyle(fontSize: 12, color: AppColors.red500),
+            ),
+            const SizedBox(height: 12),
+            _CopyableField(label: 'App Key', value: appKey),
+            const SizedBox(height: 8),
+            _CopyableField(label: 'App Secret', value: appSecret),
+          ],
+        ),
+        actions: [
+          SizedBox(
+            width: double.infinity,
+            height: 44,
+            child: FilledButton(
+              onPressed: () => Navigator.pop(dialogCtx),
+              child: const Text('我已保存'),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildAppCard({
+    required Map<String, dynamic> app,
+    required bool isLight,
+  }) {
+    final id = (app['id'] as num?)?.toInt() ?? 0;
+    final name = app['name']?.toString() ?? '';
+    final appKey = app['app_key']?.toString() ?? '';
+    final enabled = app['enabled'] != false;
+    final callCount = (app['call_count'] as num?)?.toInt() ?? 0;
+    final scopes = app['scopes']?.toString() ?? '';
+    final rateLimit = (app['rate_limit'] as num?)?.toInt() ?? 0;
+
+    return AppCard(
+      margin: const EdgeInsets.only(bottom: 10),
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Text(
+                          name,
+                          style: const TextStyle(
+                            fontSize: 14,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                        const SizedBox(width: 6),
+                        // 应用状态徽章：「启用」= success 绿。底色和前景是一对，
+                        // 必须同时改，否则会变成绿字压蓝底。
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 6,
+                            vertical: 2,
+                          ),
+                          decoration: BoxDecoration(
+                            color: enabled
+                                ? AppColors.success.withAlpha(25)
+                                : AppColors.slate400.withAlpha(25),
+                            // 10px 微徽章。原值 4，全库这一类统一走 sm。
+                            borderRadius: BorderRadius.circular(AppRadius.sm),
+                          ),
+                          child: Text(
+                            enabled ? '启用' : '禁用',
+                            style: TextStyle(
+                              fontSize: 10,
+                              fontWeight: FontWeight.w700,
+                              // 底色是同一个色的 alpha=25 淡底。
+                              color: context.surfaces.tintFg(
+                                enabled
+                                    ? AppColors.success
+                                    : AppColors.slate400,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 4),
+                    GestureDetector(
+                      onTap: () {
+                        Clipboard.setData(ClipboardData(text: appKey));
+                        AppSnack.success(context, 'App Key 已复制');
+                      },
+                      child: Row(
+                        children: [
+                          Flexible(
+                            child: Text(
+                              appKey,
+                              style: TextStyle(
+                                fontSize: 11,
+                                fontFamily: 'monospace',
+                                color: isLight
+                                    ? AppColors.slate500
+                                    : AppColors.slate400,
+                              ),
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                          const SizedBox(width: 4),
+                          Icon(Icons.copy, size: 12, color: AppColors.slate400),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    Wrap(
+                      spacing: 6,
+                      runSpacing: 6,
+                      children: scopes.isEmpty
+                          ? [
+                              const Chip(
+                                label: Text('未授权任何范围'),
+                                visualDensity: VisualDensity.compact,
+                              ),
+                            ]
+                          : _parseScopes(scopes)
+                                .map(
+                                  (scope) => Chip(
+                                    label: Text(_scopeLabel(scope)),
+                                    visualDensity: VisualDensity.compact,
+                                  ),
+                                )
+                                .toList(),
+                    ),
+                  ],
+                ),
+              ),
+              PopupMenuButton<String>(
+                icon: Icon(
+                  Icons.more_vert,
+                  size: 18,
+                  color: isLight ? AppColors.slate400 : AppColors.slate500,
+                ),
+                itemBuilder: (_) => [
+                  const PopupMenuItem(value: 'edit', child: Text('编辑')),
+                  const PopupMenuItem(
+                    value: 'view_secret',
+                    child: Text('查看密钥'),
+                  ),
+                  PopupMenuItem(
+                    value: 'toggle',
+                    child: Text(enabled ? '禁用' : '启用'),
+                  ),
+                  const PopupMenuItem(value: 'reset', child: Text('重置密钥')),
+                  const PopupMenuItem(value: 'logs', child: Text('调用日志')),
+                  const PopupMenuItem(
+                    value: 'delete',
+                    child: Text(
+                      '删除',
+                      style: TextStyle(color: AppColors.red500),
+                    ),
+                  ),
+                ],
+                onSelected: (v) async {
+                  switch (v) {
+                    case 'edit':
+                      _showEditDialog(id, name, scopes, rateLimit);
+                      break;
+                    case 'view_secret':
+                      _showViewSecretDialog(id, appKey);
+                      break;
+                    case 'toggle':
+                      final confirm = await showDialog<bool>(
+                        context: context,
+                        builder: (d) => AlertDialog(
+                          title: Text(enabled ? '禁用应用' : '启用应用'),
+                          content: Text(
+                            enabled
+                                ? '确认禁用「$name」吗？禁用后该 App Key / App Secret 将立即失效。'
+                                : '确认启用「$name」吗？',
+                          ),
+                          actions: [
+                            TextButton(
+                              onPressed: () => Navigator.pop(d, false),
+                              child: const Text('取消'),
+                            ),
+                            FilledButton(
+                              onPressed: () => Navigator.pop(d, true),
+                              child: Text(enabled ? '禁用' : '启用'),
+                            ),
+                          ],
+                        ),
+                      );
+                      if (confirm == true) {
+                        try {
+                          await DioClient.instance.dio.put(
+                            enabled
+                                ? ApiEndpoints.openApiAppDisable(id)
+                                : ApiEndpoints.openApiAppEnable(id),
+                          );
+                          if (!mounted) {
+                            return;
+                          }
+                          await _load();
+                          if (!mounted) {
+                            return;
+                          }
+                          AppSnack.success(
+                            context,
+                            enabled ? '应用已禁用' : '应用已启用',
+                          );
+                        } catch (error) {
+                          if (!mounted) {
+                            return;
+                          }
+                          AppSnack.error(
+                            context,
+                            extractErrorMessage(
+                              error,
+                              enabled ? '禁用应用失败' : '启用应用失败',
+                            ),
+                          );
+                        }
+                      }
+                      break;
+                    case 'reset':
+                      try {
+                        final resp = await DioClient.instance.dio.put(
+                          ApiEndpoints.openApiAppResetSecret(id),
+                        );
+                        final data = extractData(resp.data);
+                        if (data is Map && data['app_secret'] != null) {
+                          _showSecretDialog(
+                            appKey,
+                            data['app_secret'].toString(),
+                          );
+                        }
+                      } catch (error) {
+                        if (!mounted) {
+                          return;
+                        }
+                        AppSnack.error(
+                          context,
+                          extractErrorMessage(error, '重置密钥失败'),
+                        );
+                      }
+                      break;
+                    case 'logs':
+                      _showLogsDialog(id, name);
+                      break;
+                    case 'delete':
+                      final confirm = await showDialog<bool>(
+                        context: context,
+                        builder: (d) => AlertDialog(
+                          title: const Text('删除应用'),
+                          content: Text('确定要删除「$name」吗？'),
+                          actions: [
+                            Row(
+                              children: [
+                                Expanded(
+                                  child: SizedBox(
+                                    height: 44,
+                                    child: OutlinedButton(
+                                      onPressed: () => Navigator.pop(d, false),
+                                      child: const Text('取消'),
+                                    ),
+                                  ),
+                                ),
+                                const SizedBox(width: 12),
+                                Expanded(
+                                  child: SizedBox(
+                                    height: 44,
+                                    child: FilledButton(
+                                      onPressed: () => Navigator.pop(d, true),
+                                      style: FilledButton.styleFrom(
+                                        backgroundColor: AppColors.red500,
+                                      ),
+                                      child: const Text('删除'),
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ],
+                        ),
+                      );
+                      if (confirm == true) {
+                        try {
+                          await DioClient.instance.dio.delete(
+                            ApiEndpoints.openApiAppById(id),
+                          );
+                          if (!mounted) {
+                            return;
+                          }
+                          await _load();
+                          if (!mounted) {
+                            return;
+                          }
+                          AppSnack.success(context, '应用已删除');
+                        } catch (error) {
+                          if (!mounted) {
+                            return;
+                          }
+                          AppSnack.error(
+                            context,
+                            extractErrorMessage(error, '删除应用失败'),
+                          );
+                        }
+                      }
+                      break;
+                  }
+                },
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Text(
+            '调用次数: $callCount · 速率限制: $rateLimit/小时',
+            style: TextStyle(
+              fontSize: 11,
+              color: isLight ? AppColors.slate500 : AppColors.slate400,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showEditDialog(int id, String name, String scopes, int rateLimit) {
+    final nameC = TextEditingController(text: name);
+    final rateLimitC = TextEditingController(text: rateLimit.toString());
+    final selectedScopes = _parseScopes(scopes).toSet();
+
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: true,
+      useRootNavigator: true,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setSheetState) {
+          final navigator = Navigator.of(ctx);
+          return Padding(
+            padding: EdgeInsets.fromLTRB(
+              20,
+              0,
+              20,
+              MediaQuery.of(ctx).viewInsets.bottom + 20,
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                const Text(
+                  '编辑应用',
+                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                ),
+                const SizedBox(height: 16),
+                TextField(
+                  controller: nameC,
+                  decoration: const InputDecoration(labelText: '应用名称'),
+                ),
+                const SizedBox(height: 12),
+                const Text(
+                  '权限范围',
+                  style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+                ),
+                const SizedBox(height: 8),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: _apiScopeOptions.map((option) {
+                    return FilterChip(
+                      label: Text(option.label),
+                      selected: selectedScopes.contains(option.value),
+                      onSelected: (selected) {
+                        setSheetState(() {
+                          if (selected) {
+                            selectedScopes.add(option.value);
+                          } else {
+                            selectedScopes.remove(option.value);
+                          }
+                        });
+                      },
+                    );
+                  }).toList(),
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: rateLimitC,
+                  keyboardType: TextInputType.number,
+                  decoration: const InputDecoration(
+                    labelText: '速率限制（次/小时）',
+                    hintText: '0 表示不限制',
+                  ),
+                ),
+                const SizedBox(height: 20),
+                SizedBox(
+                  height: 44,
+                  child: FilledButton(
+                    onPressed: () async {
+                      try {
+                        await DioClient.instance.dio.put(
+                          ApiEndpoints.openApiAppById(id),
+                          data: {
+                            'name': nameC.text.trim(),
+                            'scopes': _joinScopes(selectedScopes.toList()),
+                            'rate_limit':
+                                int.tryParse(rateLimitC.text.trim()) ?? 0,
+                          },
+                        );
+                        if (!mounted) {
+                          return;
+                        }
+                        navigator.pop();
+                        await _load();
+                        // _load() 又是一次 await，弹窗的 ctx 此时已随 pop 失效，
+                        // 用 State 的 context 前再判一次 mounted。
+                        if (!mounted) {
+                          return;
+                        }
+                        AppSnack.success(context, '应用已保存');
+                      } catch (error) {
+                        if (!mounted) {
+                          return;
+                        }
+                        AppSnack.error(
+                          context,
+                          extractErrorMessage(error, '保存应用失败'),
+                        );
+                      }
+                    },
+                    child: const Text('保存'),
+                  ),
+                ),
+                const SizedBox(height: 8),
+                SizedBox(
+                  height: 44,
+                  child: OutlinedButton(
+                    onPressed: () => Navigator.of(ctx).pop(),
+                    child: const Text('取消'),
+                  ),
+                ),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  void _showViewSecretDialog(int id, String appKey) {
+    final passwordC = TextEditingController();
+    showDialog(
+      context: context,
+      builder: (dialogCtx) => AlertDialog(
+        title: const Text('查看密钥'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text(
+              '需要输入当前登录用户的密码来查看 App Secret',
+              style: TextStyle(fontSize: 13),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: passwordC,
+              obscureText: true,
+              decoration: const InputDecoration(labelText: '密码'),
+            ),
+          ],
+        ),
+        actions: [
+          Row(
+            children: [
+              Expanded(
+                child: SizedBox(
+                  height: 44,
+                  child: OutlinedButton(
+                    onPressed: () => Navigator.pop(dialogCtx),
+                    child: const Text('取消'),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: SizedBox(
+                  height: 44,
+                  child: FilledButton(
+                    onPressed: () async {
+                      if (passwordC.text.isEmpty) return;
+                      try {
+                        final resp = await DioClient.instance.dio.post(
+                          ApiEndpoints.openApiAppViewSecret(id),
+                          data: {'password': passwordC.text},
+                        );
+                        final data = extractData(resp.data);
+                        if (!mounted) {
+                          return;
+                        }
+                        Navigator.of(dialogCtx).pop();
+                        if (data is Map && data['app_secret'] != null) {
+                          _showSecretDialog(
+                            appKey,
+                            data['app_secret'].toString(),
+                          );
+                        }
+                      } catch (error) {
+                        if (mounted) {
+                          AppSnack.error(
+                            context,
+                            extractErrorMessage(error, '查看密钥失败'),
+                          );
+                        }
+                      }
+                    },
+                    child: const Text('确认'),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showLogsDialog(int appId, String appName) async {
+    List<Map<String, dynamic>> logs = [];
+    try {
+      final resp = await DioClient.instance.dio.get(
+        ApiEndpoints.openApiAppLogs(appId),
+        queryParameters: {'page': 1, 'page_size': 50},
+      );
+      final paginated = extractPaginated(resp.data);
+      logs = paginated.items;
+    } catch (error) {
+      if (mounted) {
+        AppSnack.error(context, extractErrorMessage(error, '加载调用日志失败'));
+      }
+    }
+
+    if (!mounted) return;
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: true,
+      useRootNavigator: true,
+      builder: (ctx) => SizedBox(
+        height: MediaQuery.of(ctx).size.height * 0.6,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 20),
+              child: Text(
+                '$appName 调用日志',
+                style: const TextStyle(
+                  fontSize: 16,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+            ),
+            const SizedBox(height: 12),
+            Expanded(
+              child: logs.isEmpty
+                  ? const Center(
+                      child: Text(
+                        '暂无日志',
+                        style: TextStyle(color: AppColors.slate400),
+                      ),
+                    )
+                  : ListView.builder(
+                      padding: const EdgeInsets.symmetric(horizontal: 20),
+                      itemCount: logs.length,
+                      itemBuilder: (_, i) {
+                        final log = logs[i];
+                        final status = (log['status'] as num?)?.toInt() ?? 0;
+                        final ok = status >= 200 && status < 300;
+                        final time = DateTime.tryParse(
+                          log['created_at']?.toString() ?? '',
+                        );
+                        final duration =
+                            (log['duration'] as num?)?.toDouble() ?? 0;
+                        return AppCard(
+                          margin: const EdgeInsets.only(bottom: 6),
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 12,
+                            vertical: 10,
+                          ),
+                          radius: AppRadius.md,
+                          child: Row(
+                            children: [
+                              // 同上：HTTP 状态码徽章，2xx = success 绿。
+                              // 与页面下方那份调用日志徽章必须同色，否则同一个
+                              // 200 在两个入口是两种颜色。
+                              Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 4,
+                                  vertical: 2,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: ok
+                                      ? AppColors.success.withAlpha(25)
+                                      : AppColors.red500.withAlpha(25),
+                                  // 10px 微徽章，嵌在 md 的日志卡里 → 走 sm。
+                                  borderRadius: BorderRadius.circular(
+                                    AppRadius.sm,
+                                  ),
+                                ),
+                                child: Text(
+                                  '$status',
+                                  style: TextStyle(
+                                    fontSize: 10,
+                                    fontWeight: FontWeight.w700,
+                                    fontFamily: 'monospace',
+                                    // 底色是同一个色的 alpha=25 淡底。
+                                    color: AppSurfaces.of(ctx).tintFg(
+                                      ok
+                                          ? AppColors.success
+                                          : AppColors.red500,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      '${log['method'] ?? ''} ${log['endpoint'] ?? ''}',
+                                      style: const TextStyle(
+                                        fontSize: 12,
+                                        fontFamily: 'monospace',
+                                      ),
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                    ),
+                                    Text(
+                                      '${log['ip'] ?? ''} · ${duration.toStringAsFixed(1)}ms',
+                                      style: TextStyle(
+                                        fontSize: 10,
+                                        color: AppColors.slate400,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                              Text(
+                                formatTimeCn(time),
+                                style: const TextStyle(
+                                  fontSize: 10,
+                                  color: AppColors.slate400,
+                                ),
+                              ),
+                            ],
+                          ),
+                        );
+                      },
+                    ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _CopyableField extends StatelessWidget {
+  final String label;
+  final String value;
+  const _CopyableField({required this.label, required this.value});
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          label,
+          style: const TextStyle(fontSize: 11, color: AppColors.slate400),
+        ),
+        const SizedBox(height: 4),
+        GestureDetector(
+          onTap: () {
+            Clipboard.setData(ClipboardData(text: value));
+            AppSnack.success(context, '已复制 $label');
+          },
+          child: Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(10),
+            decoration: BoxDecoration(
+              color: AppColors.slate100,
+              // 可复制的凭据代码块，嵌在卡片里的次级底块 → sm。
+              borderRadius: BorderRadius.circular(AppRadius.sm),
+            ),
+            child: Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    value,
+                    style: const TextStyle(
+                      fontSize: 12,
+                      fontFamily: 'monospace',
+                    ),
+                  ),
+                ),
+                const Icon(Icons.copy, size: 14, color: AppColors.slate400),
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+// ── Standalone logs page (for route /open-api/:id/logs) ──
+
+class OpenApiLogsPage extends ConsumerStatefulWidget {
+  final int appId;
+  const OpenApiLogsPage({super.key, required this.appId});
+
+  @override
+  ConsumerState<OpenApiLogsPage> createState() => _OpenApiLogsPageState();
+}
+
+class _OpenApiLogsPageState extends ConsumerState<OpenApiLogsPage> {
+  List<Map<String, dynamic>> _logs = [];
+  bool _loading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    setState(() => _loading = true);
+    try {
+      final resp = await DioClient.instance.dio.get(
+        ApiEndpoints.openApiAppLogs(widget.appId),
+        queryParameters: {'page': 1, 'page_size': 100},
+      );
+      final paginated = extractPaginated(resp.data);
+      setState(() {
+        _logs = paginated.items;
+        _loading = false;
+      });
+    } catch (_) {
+      setState(() => _loading = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final isLight = Theme.of(context).brightness == Brightness.light;
+
+    return Scaffold(
+      body: Padding(
+        padding: EdgeInsets.only(top: MediaQuery.of(context).padding.top + 12),
+        child: Column(
+          children: [
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 20),
+              child: Row(
+                children: [
+                  const AppBackButton(),
+                  const SizedBox(width: 8),
+                  const Expanded(
+                    child: Text(
+                      'API 调用日志',
+                      style: TextStyle(
+                        fontSize: 24,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 16),
+            Expanded(
+              child: RefreshIndicator(
+                color: AppColors.primary,
+                onRefresh: _load,
+                child: _loading
+                    ? ListView(
+                        physics: const AlwaysScrollableScrollPhysics(),
+                        children: const [
+                          SizedBox(height: 120),
+                          Center(
+                            child: CircularProgressIndicator(
+                              color: AppColors.primary,
+                            ),
+                          ),
+                        ],
+                      )
+                    : _logs.isEmpty
+                    ? ListView(
+                        physics: const AlwaysScrollableScrollPhysics(),
+                        children: const [
+                          SizedBox(height: 100),
+                          Center(
+                            child: Text(
+                              '暂无日志',
+                              style: TextStyle(color: AppColors.slate400),
+                            ),
+                          ),
+                        ],
+                      )
+                    : ListView.builder(
+                        padding: const EdgeInsets.fromLTRB(20, 0, 20, 24),
+                        itemCount: _logs.length,
+                        itemBuilder: (_, i) {
+                          final log = _logs[i];
+                          final status = (log['status'] as num?)?.toInt() ?? 0;
+                          final ok = status >= 200 && status < 300;
+                          final time = DateTime.tryParse(
+                            log['created_at']?.toString() ?? '',
+                          );
+                          final duration =
+                              (log['duration'] as num?)?.toDouble() ?? 0;
+                          return AppCard(
+                            margin: const EdgeInsets.only(bottom: 8),
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 14,
+                              vertical: 12,
+                            ),
+                            child: Row(
+                              children: [
+                                // HTTP 状态码徽章：2xx 是「成功」，走 success 绿，
+                                // 与失败的红成对。底色和前景是一对，必须同时改。
+                                Container(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 5,
+                                    vertical: 2,
+                                  ),
+                                  decoration: BoxDecoration(
+                                    color: ok
+                                        ? AppColors.success.withAlpha(25)
+                                        : AppColors.red500.withAlpha(25),
+                                    // 10px 微徽章，嵌在 lg 的日志卡里 → 走 sm。
+                                    borderRadius: BorderRadius.circular(
+                                      AppRadius.sm,
+                                    ),
+                                  ),
+                                  child: Text(
+                                    '$status',
+                                    style: TextStyle(
+                                      fontSize: 10,
+                                      fontWeight: FontWeight.w700,
+                                      fontFamily: 'monospace',
+                                      // 底色是同一个色的 alpha=25 淡底。
+                                      color: context.surfaces.tintFg(
+                                        ok
+                                            ? AppColors.success
+                                            : AppColors.red500,
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                                const SizedBox(width: 10),
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                        '${log['method'] ?? ''} ${log['endpoint'] ?? ''}',
+                                        style: const TextStyle(
+                                          fontSize: 12,
+                                          fontFamily: 'monospace',
+                                          fontWeight: FontWeight.w500,
+                                        ),
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                      ),
+                                      Text(
+                                        '${log['ip'] ?? ''} · ${duration.toStringAsFixed(1)}ms',
+                                        style: TextStyle(
+                                          fontSize: 10,
+                                          color: isLight
+                                              ? AppColors.slate500
+                                              : AppColors.slate400,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                                Text(
+                                  time != null ? formatTimeCn(time) : '',
+                                  style: TextStyle(
+                                    fontSize: 10,
+                                    color: isLight
+                                        ? AppColors.slate400
+                                        : AppColors.slate500,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          );
+                        },
+                      ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}

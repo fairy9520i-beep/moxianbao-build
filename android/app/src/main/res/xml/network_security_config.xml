@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- Cleartext remains enabled for trusted local HTTP targets. The app blocks
+         remote HTTP URLs in Dart before they can be persisted or used. -->
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>

@@ -1,0 +1,3422 @@
+import 'dart:async';
+
+import 'package:flutter/material.dart';
+// ScrollDirection 只在 rendering 里导出，material/widgets 都没有转出来。
+// 用它来区分「用户自己拖的」和「恢复流程 jumpTo 出来的」滚动。
+import 'package:flutter/rendering.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
+
+import '../../../core/auth/auth_provider.dart';
+import '../../../core/network/api_endpoints.dart';
+import '../../../core/network/dio_client.dart';
+import '../../../core/storage/secure_storage.dart';
+import '../../../core/network/sse_client.dart';
+import '../../../core/theme/app_theme.dart';
+import '../../../core/theme/design_tokens.dart';
+import '../../../shared/models/task.dart';
+import '../../../shared/models/task_view.dart';
+import '../../../shared/utils/api_utils.dart';
+import '../../../shared/utils/panel_enums.dart';
+import '../../../shared/utils/sse_replay_buffer.dart';
+import '../../../shared/utils/task_command.dart';
+import '../../../shared/utils/time_utils.dart';
+import '../../../shared/utils/log_background.dart';
+import '../../../shared/utils/log_line_buffer.dart';
+import '../../../shared/widgets/app_circle_add_button.dart';
+import '../../../shared/widgets/app_buttons.dart';
+import '../../../shared/widgets/app_card.dart';
+import '../../../shared/widgets/app_notice.dart';
+import '../../../shared/widgets/app_snack.dart';
+import '../../../shared/widgets/app_state_views.dart';
+import '../../../shared/widgets/log_view.dart';
+import '../providers/task_provider.dart';
+import '../providers/task_view_provider.dart';
+import '../utils/task_list_rows.dart';
+import '../widgets/task_view_sheets.dart';
+
+class TaskListPage extends ConsumerStatefulWidget {
+  const TaskListPage({super.key});
+
+  @override
+  ConsumerState<TaskListPage> createState() => _TaskListPageState();
+}
+
+class _TaskStatusFilter {
+  final String label;
+  final String? value;
+
+  const _TaskStatusFilter(this.label, this.value);
+}
+
+const _taskStatusFilters = [
+  _TaskStatusFilter('全部', null),
+  _TaskStatusFilter('运行中', '2'),
+  _TaskStatusFilter('排队中', '0.5'),
+  _TaskStatusFilter('已启用', '1'),
+  _TaskStatusFilter('已禁用', '0'),
+];
+
+enum _TaskBatchAction { run, enable, disable, delete }
+
+class _TaskListPageState extends ConsumerState<TaskListPage> {
+  static const _collapsedGroupsStorageKey = 'tasks.collapsed_groups';
+  static const _scrollOffsetStorageKey = 'tasks.scroll_offset';
+  static const _selectedGroupStorageKey = 'tasks.selected_group';
+  static const _groupOrderStorageKey = 'tasks.group_order';
+
+  /// 选中的任务视图 id。存空串表示「全部任务」。
+  /// 视图是全局共享的，别人随时可能删掉它，所以恢复时必须能回落。
+  static const _selectedViewStorageKey = 'tasks.selected_view';
+  final _searchController = TextEditingController();
+  final _scrollController = ScrollController();
+  final Set<String> _collapsedGroups = <String>{};
+  final Set<int> _selectedTaskIds = <int>{};
+  final List<String> _knownGroups = <String>[];
+  List<String> _groupOrder = <String>[];
+  bool _groupReorderMode = false;
+  bool _selectionMode = false;
+  bool _taskSortMode = false;
+  Timer? _debounce;
+  bool _scrollRestoreStarted = false;
+  bool _restoredScrollOffset = false;
+  // 已经排了一次「下一帧再试恢复」，避免 build 和重试链重复排帧。
+  bool _scrollRestoreScheduled = false;
+  // 等 ScrollController attach 的帧数。列表还停在加载/错误/空态时它没有 clients，
+  // 只能一帧一帧地等；这个计数是防止一直等不到时无限排帧下去的兜底。
+  int _scrollRestoreWaitFrames = 0;
+  // 用户是不是已经自己滚过了。一旦为真，恢复流程必须立刻收手（见 _stepRestoreScrollOffset）。
+  bool _userScrolled = false;
+  // 滚动位置写盘的防抖定时器与「还没落地的最新值」。
+  Timer? _scrollSaveDebounce;
+  String? _pendingScrollOffset;
+
+  // 等待 ScrollController attach 的帧数上限。
+  // 正常情况下列表挂载当帧就能拿到 clients，这个上限只在「一直卡在加载态 / 错误态」
+  // 时才会用到（加载动画会持续产帧），约合 10 秒后放弃恢复、但仍然放开保存闸。
+  static const int _maxScrollRestoreWaitFrames = 600;
+
+  @override
+  void initState() {
+    super.initState();
+    Future.microtask(_bootstrapTaskPage);
+    _scrollController.addListener(_onScroll);
+    // 恢复滚动位置只能从「首帧之后」起跑：ScrollController 是在 build() 返回、
+    // Scrollable 挂载时才 attach 的，在 build 体内同步调用永远是 hasClients == false。
+    // 这里补一个首帧回调兜底，否则常见路径（provider 无轮询 / 无 SSE、_onScroll 不 setState）
+    // 下压根不会有第二次 rebuild，_restoredScrollOffset 会永远是 false，
+    // 把下面 _onScroll 里的保存闸永久锁死 —— 滚动位置一个字节都写不进去。
+    _scheduleScrollRestore();
+  }
+
+  /// 进入任务页时的初始化。
+  ///
+  /// 顺序是刻意排的：**任务列表那次请求不能被可选能力挡住**。
+  /// 视图列表（`/api/tasks/views`）在老面板上 404、viewer 角色 403，而 dio 的
+  /// connectTimeout 是 15s、receiveTimeout 30s —— 面板慢或正在重启时，先 await
+  /// 它等于任务列表 15~30s 一个请求都不发，而每次切回本页都会重来一遍。
+  /// 只有「本地存了视图 id、provider 里却还没有选中视图」这一种真·冷启动恢复，
+  /// 才必须先等视图列表（否则没法把 id 还原成规则）；其余情况让它在后台跑，
+  /// 视图按钮靠 `ref.watch` 在它回来之后自然刷新。
+  ///
+  /// 另一条硬约束：整个流程**只发一次任务列表请求**。恢复分组、恢复视图都用
+  /// 不发请求的 setXxxSelection 写进 provider，最后统一 load() 一次 ——
+  /// 否则先发出去的那次不带规则、后发的带规则，两次都会写 `state.tasks`，
+  /// 谁后到谁赢，用户会看到「按钮写着视图名、列表却是没筛过的全量」。
+  Future<void> _bootstrapTaskPage() async {
+    await _restoreTaskUiState();
+    if (!mounted) {
+      return;
+    }
+    final savedViewId = await _readSavedViewId();
+    if (!mounted) {
+      return;
+    }
+    // 任务视图是**可选能力**：老面板没有这条路由、viewer 角色也拿不到，
+    // 那两种情况 load() 内部会静默降级成「没有视图」，不会抛也不会红。
+    final loadingViews = ref.read(taskViewProvider.notifier).load();
+    // 「恢复上次的视图」是个迟到的动作：等视图列表回来可能要好几秒（最坏是 dio 的
+    // 15~30s 超时）。这期间筛选按钮是可点的，用户完全可能自己切了视图。
+    // 记下起点，回来时发现已经不是它了就整个让位 —— 否则会把用户刚选的那条弹回去，
+    // 而且只改 provider 不改存储，留下「界面 = 旧视图、存储 = 新视图」的分叉。
+    final selectionAtStart = ref.read(taskProvider).selectedViewId;
+    bool userTookOver() =>
+        ref.read(taskProvider).selectedViewId != selectionAtStart;
+    final coldRestore = savedViewId != null && selectionAtStart == null;
+    if (coldRestore) {
+      await loadingViews;
+      if (!mounted || userTookOver()) {
+        return;
+      }
+      await _applySavedView(savedViewId);
+      if (!mounted) {
+        return;
+      }
+      await ref.read(taskProvider.notifier).load(refresh: true);
+      return;
+    }
+    if (savedViewId == null) {
+      // 上次就是「全部任务」。taskProvider 是全局、非 autoDispose 的，切走切回
+      // 不会重建状态，可能还带着上一轮的规则回来 —— 先清掉，下面那次 load()
+      // 才是对的参数。这一步不需要视图列表。
+      await _applySavedView(null);
+      if (!mounted) {
+        return;
+      }
+    }
+    await ref.read(taskProvider.notifier).load(refresh: true);
+    if (savedViewId == null) {
+      // 上面已经清成「全部任务」了，视图列表回来也改不了这次请求的参数。
+      return;
+    }
+    if (!mounted) {
+      return;
+    }
+    // 视图列表晚一点回来没关系，但回来之后必须再校一次：这条视图可能已经被
+    // 别人删了 / 隐藏了 / 改过规则（表是全站共享的），那样上面那次请求带的参数
+    // 就是错的。真变了才补一次请求，没变就一次都不多发。
+    await loadingViews;
+    if (!mounted || userTookOver()) {
+      return;
+    }
+    if (await _applySavedView(savedViewId) && mounted) {
+      await ref.read(taskProvider.notifier).load(refresh: true);
+    }
+  }
+
+  void _onScroll() {
+    // 任务是 `all=1` 一次性全量拉回来的，列表卡顿靠 ListView.builder 虚拟化解决，
+    // 不需要「滚到底再加载下一页」，所以这里只剩记录滚动位置这一件事。
+    if (!_scrollController.hasClients) {
+      return;
+    }
+    // 区分「用户自己拖的」和「恢复流程 jumpTo 出来的」：
+    // jumpTo 走的是 goIdle -> IdleScrollActivity，userScrollDirection 始终是 idle；
+    // 只有 applyUserOffset（真的有手指在拖）才会把它改成 forward/reverse。
+    if (_scrollController.position.userScrollDirection !=
+        ScrollDirection.idle) {
+      _userScrolled = true;
+    }
+    // 恢复上次位置的过程中会连跳好几帧（见 _restoreScrollOffsetIfNeeded），
+    // 那些中间位置不能写回存储，否则会把用户真正停留的深位置覆盖成一个很浅的值。
+    // 但用户一旦自己接管，恢复流程会立刻放弃、后面不会再有程序化 jumpTo，
+    // 这时即使 _restoredScrollOffset 还没置位也可以放心记。
+    if (!_restoredScrollOffset && !_userScrolled) {
+      return;
+    }
+    _scheduleScrollOffsetSave(_scrollController.offset);
+  }
+
+  /// 滚动位置写盘的防抖。
+  ///
+  /// `SecureStorage.saveUiState` 每次都是一趟 SharedPreferences 平台通道往返，
+  /// 而一次 fling 会打出几百条滚动通知 —— 原来是一条一写，几百次往返，
+  /// 正好把虚拟化省下来的开销又还回去了。这里只攒住最新值，停下来 250ms 才落盘。
+  void _scheduleScrollOffsetSave(double offset) {
+    _pendingScrollOffset = offset.toStringAsFixed(2);
+    _scrollSaveDebounce?.cancel();
+    _scrollSaveDebounce = Timer(
+      const Duration(milliseconds: 250),
+      _flushScrollOffset,
+    );
+  }
+
+  /// 把攒住的滚动位置真正写进存储。dispose 里也会调一次，
+  /// 否则「滚到底 -> 立刻切走」这条路径上最后一段位置会随防抖定时器一起被丢掉。
+  void _flushScrollOffset() {
+    final pending = _pendingScrollOffset;
+    if (pending == null) {
+      return;
+    }
+    _pendingScrollOffset = null;
+    // 不 await：dispose 里也会走到这儿，State 已经在销毁路径上，写失败也没有可补救的动作。
+    SecureStorage.saveUiState(_scrollOffsetStorageKey, pending);
+  }
+
+  void _showMessage(String message) => AppSnack.show(context, message);
+
+  void _showSuccess(String message) => AppSnack.success(context, message);
+
+  void _showError(String message) => AppSnack.error(context, message);
+
+  void _showWarning(String message) => AppSnack.warn(context, message);
+
+  /// 全部任务操作失败的漏斗：批量操作 / 排序保存 / 停止 / 启停 / 复制 / 置顶 / 删除，
+  /// 外加分组的重命名 / 删除 / 添加任务 / 新建，都从这里出提示，
+  /// 所以着色和错误文案提取只需要改这一处。
+  Future<void> _showActionError(dynamic error, String fallback) async {
+    _showError(_extractTaskError(error, fallback));
+  }
+
+  bool _isAllTasksSelected(List<Task> tasks) =>
+      tasks.isNotEmpty &&
+      tasks.every((task) => _selectedTaskIds.contains(task.id));
+
+  void _setSelectionMode(bool enabled) {
+    setState(() {
+      _selectionMode = enabled;
+      if (!enabled) {
+        _selectedTaskIds.clear();
+      }
+    });
+  }
+
+  void _toggleTaskSelection(int id) {
+    setState(() {
+      _selectionMode = true;
+      if (_selectedTaskIds.contains(id)) {
+        _selectedTaskIds.remove(id);
+      } else {
+        _selectedTaskIds.add(id);
+      }
+      if (_selectedTaskIds.isEmpty) {
+        _selectionMode = false;
+      }
+    });
+  }
+
+  void _toggleSelectAllTasks(List<Task> tasks) {
+    final visibleIds = tasks.map((task) => task.id).toSet();
+    setState(() {
+      if (visibleIds.isNotEmpty &&
+          visibleIds.every((id) => _selectedTaskIds.contains(id))) {
+        _selectedTaskIds.removeAll(visibleIds);
+        if (_selectedTaskIds.isEmpty) {
+          _selectionMode = false;
+        }
+      } else {
+        _selectionMode = true;
+        _selectedTaskIds.addAll(visibleIds);
+      }
+    });
+  }
+
+  Future<bool> _confirmBatchTaskDelete(int count) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('批量删除任务'),
+        content: Text('确定要删除选中的 $count 个任务吗？此操作不可恢复。'),
+        actions: [
+          Row(
+            children: [
+              Expanded(
+                child: SizedBox(
+                  height: 44,
+                  child: OutlinedButton(
+                    onPressed: () => Navigator.pop(dialogContext, false),
+                    child: const Text('取消'),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: SizedBox(
+                  height: 44,
+                  child: FilledButton(
+                    onPressed: () => Navigator.pop(dialogContext, true),
+                    style: FilledButton.styleFrom(
+                      backgroundColor: AppColors.red500,
+                    ),
+                    child: const Text('删除'),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+    return confirmed == true;
+  }
+
+  Future<void> _performBatchTaskAction(_TaskBatchAction action) async {
+    final ids = _selectedTaskIds.toList()..sort();
+    if (ids.isEmpty) {
+      return;
+    }
+
+    if (action == _TaskBatchAction.run && ids.length > 10) {
+      _showWarning('批量运行最多选择 10 个任务');
+      return;
+    }
+
+    if (action == _TaskBatchAction.delete) {
+      final confirmed = await _confirmBatchTaskDelete(ids.length);
+      if (!confirmed) {
+        return;
+      }
+    }
+
+    try {
+      final notifier = ref.read(taskProvider.notifier);
+      switch (action) {
+        case _TaskBatchAction.run:
+          await notifier.batchRun(ids);
+          break;
+        case _TaskBatchAction.enable:
+          await notifier.batchEnable(ids);
+          break;
+        case _TaskBatchAction.disable:
+          await notifier.batchDisable(ids);
+          break;
+        case _TaskBatchAction.delete:
+          await notifier.batchDelete(ids);
+          break;
+      }
+
+      if (!mounted) {
+        return;
+      }
+
+      _setSelectionMode(false);
+      final message = switch (action) {
+        _TaskBatchAction.run => '已批量运行 ${ids.length} 个任务',
+        _TaskBatchAction.enable => '已批量启用 ${ids.length} 个任务',
+        _TaskBatchAction.disable => '已批量禁用 ${ids.length} 个任务',
+        _TaskBatchAction.delete => '已批量删除 ${ids.length} 个任务',
+      };
+      _showSuccess(message);
+    } catch (error) {
+      await _showActionError(error, '批量操作失败');
+    }
+  }
+
+  /// 批量设置通知开关（面板 v3.3.3 / issue #149）。只作用于选中的任务；
+  /// APP 的列表是全量拉取，「全选」就是当前筛选下的全部任务，不需要面板的 `all`。
+  Future<void> _performBatchNotify() async {
+    final ids = _selectedTaskIds.toList()..sort();
+    if (ids.isEmpty) {
+      return;
+    }
+    final choice = await _showBatchNotifyDialog(ids.length);
+    if (choice == null) {
+      return;
+    }
+
+    try {
+      await ref
+          .read(taskProvider.notifier)
+          .batchSetNotify(
+            ids,
+            onFailure: choice.onFailure,
+            onSuccess: choice.onSuccess,
+          );
+      if (!mounted) {
+        return;
+      }
+      _setSelectionMode(false);
+      _showSuccess('已更新 ${ids.length} 个任务的通知设置');
+    } catch (error) {
+      // 老面板没有这条接口时，provider 已经翻译成「请升级」的中文，这里照常展示。
+      await _showActionError(error, '批量设置通知失败');
+    }
+  }
+
+  /// 失败 / 成功两行，各「开启 / 关闭 / 不修改」三档；APP 没有终止通知，所以不放那一行。
+  /// 返回的开关为 null 表示「不修改」，整体返回 null 表示取消。
+  Future<({bool? onFailure, bool? onSuccess})?> _showBatchNotifyDialog(
+    int count,
+  ) {
+    // 失败默认「开启」—— #149 要的就是一键打开失败通知；成功默认不动，免得顺手把成功通知也改了。
+    var failure = 'on';
+    var success = 'keep';
+    bool? toSwitch(String value) => value == 'keep' ? null : value == 'on';
+    const segments = [
+      ButtonSegment(value: 'on', label: Text('开启')),
+      ButtonSegment(value: 'off', label: Text('关闭')),
+      ButtonSegment(value: 'keep', label: Text('不修改')),
+    ];
+
+    return showDialog<({bool? onFailure, bool? onSuccess})>(
+      context: context,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (context, setDialogState) {
+          // 两项都「不修改」时面板会回 400，干脆不让提交。
+          final nothingToChange = failure == 'keep' && success == 'keep';
+          return AlertDialog(
+            title: const Text('批量设置通知'),
+            content: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('将修改选中的 $count 个任务'),
+                  const SizedBox(height: 16),
+                  const Text('失败时通知'),
+                  const SizedBox(height: 8),
+                  SegmentedButton<String>(
+                    segments: segments,
+                    selected: {failure},
+                    // 窄屏上三段带勾选图标会挤不下，靠底色区分选中即可。
+                    showSelectedIcon: false,
+                    onSelectionChanged: (selection) =>
+                        setDialogState(() => failure = selection.first),
+                  ),
+                  const SizedBox(height: 16),
+                  const Text('成功时通知'),
+                  const SizedBox(height: 8),
+                  SegmentedButton<String>(
+                    segments: segments,
+                    selected: {success},
+                    showSelectedIcon: false,
+                    onSelectionChanged: (selection) =>
+                        setDialogState(() => success = selection.first),
+                  ),
+                  const SizedBox(height: 16),
+                  // 面板这条接口只改开关、不碰渠道（与网页端弹窗同一句提示）。
+                  const AppNotice(
+                    color: AppColors.primary,
+                    text: '不修改任务绑定的通知渠道；没绑渠道的任务会发到默认推送渠道',
+                  ),
+                ],
+              ),
+            ),
+            actions: [
+              Row(
+                children: [
+                  Expanded(
+                    child: SizedBox(
+                      height: 44,
+                      child: OutlinedButton(
+                        onPressed: () => Navigator.pop(dialogContext),
+                        child: const Text('取消'),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: SizedBox(
+                      height: 44,
+                      child: FilledButton(
+                        onPressed: nothingToChange
+                            ? null
+                            : () => Navigator.pop(dialogContext, (
+                                onFailure: toSwitch(failure),
+                                onSuccess: toSwitch(success),
+                              )),
+                        child: const Text('确定'),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  void _openLiveLog(Task task) {
+    context.push('/tasks/${task.id}/live-logs', extra: task.name);
+  }
+
+  Future<void> _runTask(Task task) async {
+    try {
+      await ref.read(taskProvider.notifier).runTask(task.id);
+      if (!mounted) {
+        return;
+      }
+      _openLiveLog(task);
+    } catch (error) {
+      final message = _extractTaskError(error, '启动任务失败');
+      if (!mounted) {
+        return;
+      }
+      if (message.contains('运行中')) {
+        _openLiveLog(task);
+        return;
+      }
+      _showError(message);
+    }
+  }
+
+  Future<void> _stopTask(Task task) async {
+    try {
+      await ref.read(taskProvider.notifier).stopTask(task.id);
+      _showSuccess('任务已停止');
+    } catch (error) {
+      await _showActionError(error, '停止任务失败');
+    }
+  }
+
+  Future<void> _toggleTaskEnabled(Task task) async {
+    try {
+      // 按开关位分支，不按 status：禁用任务被手动运行时 status 是 0.5 / 2，
+      // 按 isDisabled 判会走进「禁用」分支 —— 给一条本来就禁用的任务再打一次
+      // 待禁用标记、提示「完成后禁用」，用户在它跑完之前根本启用不了它。
+      if (!task.isSwitchOn) {
+        await ref.read(taskProvider.notifier).enableTask(task.id);
+        _showSuccess('任务已启用');
+      } else {
+        await ref.read(taskProvider.notifier).disableTask(task.id);
+        _showSuccess(task.isRunning ? '任务已设置为完成后禁用' : '任务已禁用');
+      }
+    } catch (error) {
+      await _showActionError(error, '更新任务状态失败');
+    }
+  }
+
+  Future<void> _copyTask(Task task) async {
+    try {
+      await ref.read(taskProvider.notifier).copyTask(task.id);
+      _showSuccess('任务已复制');
+    } catch (error) {
+      await _showActionError(error, '复制任务失败');
+    }
+  }
+
+  Future<void> _togglePinned(Task task) async {
+    try {
+      if (task.isPinned) {
+        await ref.read(taskProvider.notifier).unpinTask(task.id);
+        _showSuccess('已取消置顶');
+      } else {
+        await ref.read(taskProvider.notifier).pinTask(task.id);
+        _showSuccess('已置顶任务');
+      }
+    } catch (error) {
+      await _showActionError(error, '更新置顶状态失败');
+    }
+  }
+
+  void _onSearchChanged(String value) {
+    setState(() {});
+    _debounce?.cancel();
+    _debounce = Timer(const Duration(milliseconds: 300), () {
+      if (_scrollController.hasClients && _scrollController.offset > 0) {
+        _scrollController.jumpTo(0);
+      }
+      ref.read(taskProvider.notifier).setKeyword(value);
+    });
+  }
+
+  @override
+  void dispose() {
+    _debounce?.cancel();
+    // 滚动位置是防抖写盘的，退出页面时很可能还有一次没落地的最新值。
+    // 先 cancel 掉定时器（State 都要没了，回调再跑没有意义），再手动补写一次。
+    _scrollSaveDebounce?.cancel();
+    _flushScrollOffset();
+    _searchController.dispose();
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _restoreTaskUiState() async {
+    final collapsedRaw = await SecureStorage.getUiState(
+      _collapsedGroupsStorageKey,
+    );
+    final selectedGroup = await SecureStorage.getUiState(
+      _selectedGroupStorageKey,
+    );
+    final groups = <String>{};
+    if (collapsedRaw != null && collapsedRaw.trim().isNotEmpty) {
+      groups.addAll(
+        collapsedRaw
+            .split('\n')
+            .map((item) => item.trim())
+            .where((item) => item.isNotEmpty),
+      );
+    } else {
+      groups.add('');
+    }
+    if (!mounted) {
+      return;
+    }
+    final groupOrderRaw = await SecureStorage.getUiState(_groupOrderStorageKey);
+    final savedGroupOrder = <String>[];
+    if (groupOrderRaw != null && groupOrderRaw.trim().isNotEmpty) {
+      savedGroupOrder.addAll(groupOrderRaw.split('\n').map((s) => s.trim()));
+    }
+    if (!mounted) return;
+    setState(() {
+      _collapsedGroups
+        ..clear()
+        ..addAll(groups);
+      _groupOrder = savedGroupOrder;
+    });
+    if (selectedGroup != null) {
+      // ⚠️ 兼容归一：这个 key 的**存量是裸分组名**（旧版本写进去的），
+      // 而现在发给服务端的必须是带 `分组:` 前缀的完整标签。
+      // 不归一的话，老用户升级后冷启动会拿裸名去做 LIKE，把只挂了同名普通标签
+      // 的任务一起捞回来 —— 表现为「筛了分组却混进别的任务」。
+      final normalized = Task.normalizeGroupLabel(selectedGroup);
+      // 刻意用**不发请求**的版本：setLabelFilter 会当场打出一次不带 filters /
+      // sort_rules 的请求，和 _bootstrapTaskPage 末尾那次带规则的请求撞车，
+      // 两次都写 state.tasks，谁后到谁赢。唯一一次请求留给统一的 load()。
+      ref
+          .read(taskProvider.notifier)
+          .setLabelSelection(normalized.isEmpty ? null : normalized);
+    }
+  }
+
+  /// 上次选中的视图 id。没存过 / 存的是空串 / 存了个非数字，都当成「全部任务」。
+  Future<int?> _readSavedViewId() async {
+    final raw = await SecureStorage.getUiState(_selectedViewStorageKey);
+    return int.tryParse(raw?.trim() ?? '');
+  }
+
+  /// 把「上次选中的视图」落到 taskProvider 上，**不发请求**。
+  /// 返回 true 表示生效的规则真的变了，调用方需要重新拉一次任务列表。
+  ///
+  /// 视图是**全局共享**的（表里没有 user_id），别人随时可能把它删掉或隐藏，
+  /// 所以找不到时要静静地回落到「全部任务」，并把过期的记录清掉。
+  ///
+  /// ⚠️ 回落时必须连 taskProvider 里的规则一起清：它是全局、非 autoDispose 的，
+  /// 页面切走切回只重跑 initState、不重建状态。只清本地存储的话，列表会继续被
+  /// 一条已经不存在的视图筛着，按钮却显示「全部任务」——
+  /// 用户看到的就是「明明写着全部任务，任务却少了一半」。
+  Future<bool> _applySavedView(int? savedViewId) async {
+    final before = ref.read(taskProvider);
+    TaskView? view;
+    if (savedViewId != null) {
+      final viewState = ref.read(taskViewProvider);
+      if (viewState.error != null) {
+        // 这一次没拉到视图列表（断网 / 面板 500）。这不等于「视图被删了」——
+        // 按删了处理，会在一次网络抖动之后把用户存了很久的选择连本地记录一起
+        // 清掉。保持现状，等下次进页面再校。
+        // （404 / 403 走的是 supported=false + views 清空，那是能力真的没了，
+        //   下面会正常回落到「全部任务」。）
+        return false;
+      }
+      view = viewState.viewById(savedViewId);
+      if (view != null && view.hidden) {
+        view = null;
+      }
+      if (view == null) {
+        await SecureStorage.saveUiState(_selectedViewStorageKey, '');
+        if (!mounted) {
+          return false;
+        }
+      }
+    }
+    ref.read(taskProvider.notifier).setViewSelection(view);
+    final after = ref.read(taskProvider);
+    // 只比 id 不够：视图还在、但规则被别人在网页上改过时 id 是一样的，
+    // 而已经发出去的那次请求带的仍然是旧规则，同样得重来一次。
+    return before.selectedViewId != after.selectedViewId ||
+        encodeTaskViewFilters(before.filters) !=
+            encodeTaskViewFilters(after.filters) ||
+        encodeTaskViewSortRules(before.sortRules) !=
+            encodeTaskViewSortRules(after.sortRules);
+  }
+
+  Future<void> _persistSelectedView(int? id) {
+    return SecureStorage.saveUiState(
+      _selectedViewStorageKey,
+      id?.toString() ?? '',
+    );
+  }
+
+  Future<void> _persistCollapsedGroups() {
+    return SecureStorage.saveUiState(
+      _collapsedGroupsStorageKey,
+      _collapsedGroups.join('\n'),
+    );
+  }
+
+  Future<void> _persistGroupOrder() {
+    return SecureStorage.saveUiState(
+      _groupOrderStorageKey,
+      _groupOrder.join('\n'),
+    );
+  }
+
+  /// 把「尝试恢复滚动位置」排到下一帧结束之后。
+  ///
+  /// 不能在 build 体内直接调 [_restoreScrollOffsetIfNeeded]：
+  /// Flutter 里 `ScrollController` 是在父 widget 的 build() **返回之后**、
+  /// Scrollable 挂载时才 attach 上来的，所以列表首次出现的那一帧 `hasClients` 恒为 false。
+  void _scheduleScrollRestore() {
+    if (_scrollRestoreStarted || _scrollRestoreScheduled) {
+      return;
+    }
+    _scrollRestoreScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _scrollRestoreScheduled = false;
+      _restoreScrollOffsetIfNeeded();
+    });
+  }
+
+  Future<void> _restoreScrollOffsetIfNeeded() async {
+    // 用 _scrollRestoreStarted 保证只真正跑一次
+    //（_restoredScrollOffset 要等跳完才置位，挡不住重入）。
+    if (_scrollRestoreStarted || !mounted) {
+      return;
+    }
+    if (!_scrollController.hasClients) {
+      // 列表还停在加载态 / 错误态 / 空态（那三条分支的 ListView 根本没挂 _scrollController），
+      // 或者 Scrollable 还没 attach 完。这里必须安排下一帧继续等，**不能静默返回** ——
+      // 一返回就再没有别的触发点，_restoredScrollOffset 会永远是 false，
+      // _onScroll 里的保存闸被永久锁死，滚动位置一个字节都写不进去。
+      _scrollRestoreWaitFrames++;
+      if (_scrollRestoreWaitFrames > _maxScrollRestoreWaitFrames) {
+        // 等太久（一直没拿到数据）就放弃恢复，但保存闸必须打开，
+        // 否则这一次进入页面之后再也记不住位置。
+        _scrollRestoreStarted = true;
+        _restoredScrollOffset = true;
+        return;
+      }
+      _scheduleScrollRestore();
+      return;
+    }
+    _scrollRestoreStarted = true;
+    final raw = await SecureStorage.getUiState(_scrollOffsetStorageKey);
+    final offset = double.tryParse(raw?.trim() ?? '');
+    // 读存储是异步的，这中间用户完全可能已经自己滚起来了 —— 那就别再把他拽走。
+    if (!mounted || _userScrolled || offset == null || offset <= 0) {
+      _restoredScrollOffset = true;
+      return;
+    }
+    _stepRestoreScrollOffset(offset, -1.0, 0);
+  }
+
+  /// 惰性列表的滚动位置恢复。
+  ///
+  /// `ListView.builder` 只布局可见区域，首帧的 `maxScrollExtent` 只是
+  /// 「已经布局出来的那一段 + 剩余项的粗略估算」，比真实值小得多。
+  /// 改造前直接 `offset.clamp(0, maxScrollExtent)`，深位置会被夹到很靠前的地方，
+  /// 表现为「退出任务页再进来，回不到原来的位置」。
+  ///
+  /// 所以这里逐帧往下跳：每跳一次就会带出下一屏内容、`maxScrollExtent` 随之变大，
+  /// 直到够到目标位置，或者列表确实到底了（这一帧没再变长）为止。
+  void _stepRestoreScrollOffset(
+    double target,
+    double lastMaxExtent,
+    int attempt,
+  ) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_scrollController.hasClients) {
+        // 列表中途换成了空态 / 错误态（controller 脱离），恢复就此作罢，
+        // 但要放开 _onScroll 的记录，否则这一次进入页面之后再也不记位置了。
+        _restoredScrollOffset = true;
+        return;
+      }
+      // 用户已经自己滚过了：再继续逐帧 jumpTo 就是把列表从他正在看的位置
+      // 一路拽到上一次会话残留的旧位置，视觉上就是「列表自己乱跳」。
+      // 这里立刻收手，同时放开保存闸，让他当前的位置能被正常记下来。
+      if (_userScrolled) {
+        _restoredScrollOffset = true;
+        return;
+      }
+      final position = _scrollController.position;
+      final maxExtent = position.maxScrollExtent;
+      final next = target > maxExtent ? maxExtent : target;
+      if ((position.pixels - next).abs() > 0.5) {
+        _scrollController.jumpTo(next);
+      }
+      // 收工条件：够到目标 / 内容不再变长（任务被删了、换了筛选）/ 兜底次数用完。
+      // 正常情况几帧就到位，60 次上限只是防死循环，不是期望值。
+      if (next >= target - 0.5 || maxExtent <= lastMaxExtent || attempt >= 60) {
+        _restoredScrollOffset = true;
+        return;
+      }
+      _stepRestoreScrollOffset(target, maxExtent, attempt + 1);
+    });
+  }
+
+  void _collectKnownGroups(List<Task> tasks) {
+    final groups =
+        tasks
+            .map((task) => task.groupName?.trim() ?? '')
+            .where((group) => group.isNotEmpty)
+            .toSet()
+            .toList()
+          ..sort();
+    _knownGroups
+      ..clear()
+      ..addAll(groups);
+  }
+
+  /// 「新建分组」在分组选择面板里的返回哨兵值。
+  ///
+  /// 分组名是用户输入的自由文本，理论上可能撞任何字面量，
+  /// 所以用一个不可能出现在合法分组名里的前后缀标记。
+  static const String _createGroupSentinel = '#dp:create-group#';
+
+  Future<void> _showGroupPicker() async {
+    final options = [..._knownGroups];
+    final selected = await showModalBottomSheet<String>(
+      context: context,
+      showDragHandle: true,
+      builder: (sheetContext) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const ListTile(title: Text('选择任务分组'), subtitle: Text('可筛选已有分组任务')),
+            ListTile(
+              leading: const Icon(Icons.layers_clear_outlined),
+              title: const Text('全部分组'),
+              onTap: () => Navigator.pop(sheetContext, ''),
+            ),
+            ...options.map(
+              (group) => ListTile(
+                leading: const Icon(Icons.label_outline),
+                title: Text(group),
+                trailing:
+                    ref.watch(taskProvider).labelFilter ==
+                        Task.toGroupLabel(group)
+                    ? const Icon(Icons.check, color: AppColors.primary)
+                    : null,
+                onTap: () => Navigator.pop(sheetContext, group),
+              ),
+            ),
+            const Divider(height: 1),
+            // 「新建分组」原先只挂在分组头右侧那个 18dp 的溢出菜单里。
+            // 一个分组都没有时分组头已经不渲染，这个入口必须搬到常驻位置，
+            // 否则用户就再也建不出第一个分组了。放这里同时也更好找。
+            ListTile(
+              leading: const Icon(Icons.create_new_folder_outlined),
+              title: const Text('新建分组'),
+              subtitle: const Text('从未分组的任务中挑选'),
+              onTap: () => Navigator.pop(sheetContext, _createGroupSentinel),
+            ),
+          ],
+        ),
+      ),
+    );
+
+    if (!mounted || selected == null) {
+      return;
+    }
+
+    if (selected == _createGroupSentinel) {
+      final ungrouped = ref
+          .read(taskProvider)
+          .tasks
+          .where((task) => (task.groupName ?? '').isEmpty)
+          .toList();
+      await _showCreateGroupFromUngrouped(ungrouped);
+      return;
+    }
+
+    if (_scrollController.hasClients && _scrollController.offset > 0) {
+      _scrollController.jumpTo(0);
+    }
+    // ⚠️ 发出去的必须是 `分组:生产` 而不是显示名 `生产`：
+    // 服务端做的是 `labels LIKE '%<值>%'`，传显示名会把只挂了普通标签「生产」、
+    // 根本没分组的任务也捞回来，然后在客户端落进「未分组」桶 ——
+    // 表现就是「筛了生产分组，列表里却冒出一个未分组的分组头」。
+    // 存储里仍然存裸分组名（历史格式不动），恢复时由 normalizeGroupLabel 归一。
+    ref
+        .read(taskProvider.notifier)
+        .setLabelFilter(
+          selected.isEmpty ? null : Task.toGroupLabel(selected),
+        );
+    await SecureStorage.saveUiState(_selectedGroupStorageKey, selected);
+  }
+
+  Future<void> _showViewPicker() async {
+    final result = await showTaskViewPicker(
+      context,
+      selectedViewId: ref.read(taskProvider).selectedViewId,
+    );
+    if (!mounted || result == null) {
+      return;
+    }
+    if (result.action == TaskViewPickerAction.selectAll) {
+      await _applyTaskView(null);
+      return;
+    }
+    if (result.action == TaskViewPickerAction.select) {
+      await _applyTaskView(result.view);
+      return;
+    }
+    await _openTaskViewEditor(view: result.view);
+  }
+
+  Future<void> _applyTaskView(TaskView? view) async {
+    if (_scrollController.hasClients && _scrollController.offset > 0) {
+      _scrollController.jumpTo(0);
+    }
+    ref.read(taskProvider.notifier).applyView(view);
+    await _persistSelectedView(view?.id);
+  }
+
+  Future<void> _openTaskViewEditor({TaskView? view}) async {
+    final result = await showTaskViewEditor(context, view: view);
+    if (!mounted || result == null || !result.changed) {
+      return;
+    }
+    if (view == null) {
+      // 刚建完就切过去：用户建规则本来就是为了立刻看到筛出来的结果。
+      await _applyTaskView(result.view);
+      return;
+    }
+    // 编辑 / 删除的若正好是当前选中的那条，必须按最新规则重跑一次，
+    // 否则列表会继续拿着一份过期规则（甚至一条已经不存在的视图）在筛。
+    final selectedId = ref.read(taskProvider).selectedViewId;
+    if (selectedId != view.id) {
+      return;
+    }
+    final latest = ref.read(taskViewProvider).viewById(selectedId);
+    await _applyTaskView(latest != null && !latest.hidden ? latest : null);
+  }
+
+  /// 视图入口要不要出现。
+  ///
+  /// 面板不支持（老面板 404 / viewer 403）时整个入口藏起来 —— 摆一个点了
+  /// 只会报错的按钮，比没有这个功能更糟。面板支持但一条视图都没有时也不摆，
+  /// 除非当前账号能建（否则用户只能看到一个恒为「全部任务」的死按钮）。
+  bool _showViewFilterEntry(TaskViewListState viewState, bool canManageViews) {
+    if (!viewState.supported) {
+      return false;
+    }
+    if (viewState.visibleViews.isNotEmpty) {
+      return true;
+    }
+    return canManageViews;
+  }
+
+  String? _selectedViewName(TaskListState state, TaskViewListState viewState) {
+    final view = viewState.viewById(state.selectedViewId);
+    if (view == null || view.name.trim().isEmpty) {
+      return null;
+    }
+    return view.name;
+  }
+
+  /// 筛选按钮的文字。视图名和分组名都是用户输入的自由文本，可以很长，
+  /// 不封顶会把整行挤爆。
+  Widget _buildFilterButtonLabel(String text) {
+    return ConstrainedBox(
+      constraints: const BoxConstraints(maxWidth: 110),
+      child: Text(text, maxLines: 1, overflow: TextOverflow.ellipsis),
+    );
+  }
+
+  void _clearTaskFilters() {
+    if (_scrollController.hasClients && _scrollController.offset > 0) {
+      _scrollController.jumpTo(0);
+    }
+    // 视图也是一种筛选，「清除筛选」不把它一起清掉的话，用户会以为按钮坏了。
+    ref.read(taskProvider.notifier).clearFilters();
+    SecureStorage.saveUiState(_selectedGroupStorageKey, '');
+    _persistSelectedView(null);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final state = ref.watch(taskProvider);
+    final viewState = ref.watch(taskViewProvider);
+    // 任务视图的增删改要 operator，viewer 只能看。
+    final canManageViews = ref.watch(authProvider).user?.isOperator ?? false;
+    final theme = Theme.of(context);
+    final isLight = theme.brightness == Brightness.light;
+    _collectKnownGroups(state.tasks);
+    final groupedTasks = sortTaskGroupsByOrder(
+      groupTasksByGroupName(state.tasks),
+      _groupOrder,
+    );
+    // 一个分组都没建过（或筛选后只剩「未分组」）时，那条分组头没有任何信息量：
+    // 标题恒为「未分组」、条数与头部的「共 N 个任务」重复、折叠它等于清空整页。
+    // 这种情况直接不渲染，省下 60.9dp——这是任务列表最大的一笔密度收益。
+    final onlyUngrouped =
+        groupedTasks.length == 1 && groupedTasks.first.key.isEmpty;
+    // 分组头 + 任务卡摊平成一维行列表，交给下面的 ListView.builder 惰性构建。
+    // 全量任务仍然留在 state.tasks 里，所以全选 / 分组下拉 / 拖拽排序语义不变。
+    final taskRows = buildTaskListRows(
+      groups: groupedTasks,
+      collapsedGroups: _collapsedGroups,
+      showGroupHeader: !onlyUngrouped,
+    );
+    final selectedCount = _selectedTaskIds.length;
+    final allSelected = _isAllTasksSelected(state.tasks);
+    // 排到帧末再试，不能在 build 体内直接调（那时 ScrollController 还没 attach）。
+    // initState 里已经排过一次，这里是「列表分支从加载态换成真正的 ListView」之后的补触发。
+    _scheduleScrollRestore();
+
+    return Scaffold(
+      body: Padding(
+        padding: EdgeInsets.only(top: MediaQuery.of(context).padding.top + 12),
+        child: Column(
+          children: [
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 20),
+              child: LayoutBuilder(
+                builder: (context, constraints) {
+                  const titleStyle = TextStyle(
+                    fontSize: 24,
+                    fontWeight: FontWeight.w700,
+                  );
+                  final batchLabel = _selectionMode ? '取消' : '批量';
+                  final sortLabel = _taskSortMode ? '完成' : '排序';
+                  // APP #21 同类排查：360dp 屏、字号放大到 1.3 时「标题 + 批量 + 排序 + ＋」放不下，＋会被挤出屏幕。
+                  // 按当前字号量一下这一态的按钮完整显示要多宽（与下面的显示条件逐项对应），
+                  // 放不下就让胶囊只留图标。＋ 是 44dp 命中区，按钮之间各 8dp；
+                  // 标题与按钮之间不另加间距（与原来的排版逐像素一致）。
+                  var fullWidth = measureTextWidth(context, '定时任务', titleStyle);
+                  if (!_taskSortMode) {
+                    fullWidth += AppChipButton.fullWidth(context, batchLabel);
+                  }
+                  if (!_selectionMode) {
+                    fullWidth += 8 + AppChipButton.fullWidth(context, sortLabel);
+                  }
+                  if (!_selectionMode && !_taskSortMode) {
+                    fullWidth += 8 + AppTapTarget.min;
+                  }
+                  final compact = fullWidth > constraints.maxWidth;
+                  return Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      // 字号再大也只让标题省略，右边的按钮始终完整可点。
+                      const Flexible(
+                        child: Text(
+                          '定时任务',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: titleStyle,
+                        ),
+                      ),
+                      Row(
+                        children: [
+                          if (!_taskSortMode)
+                            AppChipButton(
+                              label: batchLabel,
+                              icon: _selectionMode
+                                  ? Icons.close
+                                  : Icons.done_all,
+                              compact: compact,
+                              onTap: () => _setSelectionMode(!_selectionMode),
+                            ),
+                          if (!_selectionMode) ...[
+                            const SizedBox(width: 8),
+                            AppChipButton(
+                              label: sortLabel,
+                              icon: _taskSortMode
+                                  ? Icons.check
+                                  : Icons.swap_vert,
+                              compact: compact,
+                              // 每次松手已经各自保存过了（见 _buildTaskReorderView），
+                              // 「完成」只是退出排序模式，不再攒到这里统一提交。
+                              onTap: () {
+                                // 此刻拖了也白拖（视图带排序规则 / 有任务在跑），就不进排序模式，只说原因。
+                                // 退出不拦：「完成」任何时候都要能点。
+                                final reason = state.dragSortDisabledReason;
+                                if (!_taskSortMode && reason != null) {
+                                  _showWarning(reason);
+                                  return;
+                                }
+                                setState(() {
+                                  _taskSortMode = !_taskSortMode;
+                                  if (_taskSortMode) {
+                                    _groupReorderMode = false;
+                                  }
+                                });
+                              },
+                            ),
+                          ],
+                          if (!_selectionMode && !_taskSortMode) ...[
+                            const SizedBox(width: 8),
+                            AppCircleAddButton(
+                              onTap: () => context.push('/tasks/new'),
+                            ),
+                          ],
+                        ],
+                      ),
+                    ],
+                  );
+                },
+              ),
+            ),
+            const SizedBox(height: 16),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 20),
+              child: TextField(
+                controller: _searchController,
+                decoration: InputDecoration(
+                  hintText: '搜索任务名称或命令...',
+                  prefixIcon: const Icon(
+                    Icons.search,
+                    size: 18,
+                    color: AppColors.slate400,
+                  ),
+                  filled: true,
+                  fillColor: isLight ? Colors.white : AppColors.slate900,
+                  // 逐字复制 app_theme 的三处 OutlineInputBorder：
+                  // 计划裁决只令牌化不删除。三处圆角同值是聚焦动画的硬要求。
+                  border: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(AppRadius.md),
+                    borderSide: BorderSide(
+                      color: isLight ? AppColors.slate200 : AppColors.slate800,
+                    ),
+                  ),
+                  enabledBorder: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(AppRadius.md),
+                    borderSide: BorderSide(
+                      color: isLight ? AppColors.slate200 : AppColors.slate800,
+                    ),
+                  ),
+                  focusedBorder: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(AppRadius.md),
+                    borderSide: const BorderSide(
+                      color: AppColors.primary,
+                      width: 1.5,
+                    ),
+                  ),
+                  contentPadding: const EdgeInsets.symmetric(vertical: 12),
+                  isDense: true,
+                  suffixIcon: _searchController.text.isNotEmpty
+                      ? IconButton(
+                          icon: const Icon(
+                            Icons.clear,
+                            size: 16,
+                            color: AppColors.slate400,
+                          ),
+                          onPressed: () {
+                            _searchController.clear();
+                            setState(() {});
+                            ref.read(taskProvider.notifier).setKeyword('');
+                          },
+                        )
+                      : null,
+                ),
+                style: const TextStyle(fontSize: 14),
+                onChanged: _onSearchChanged,
+              ),
+            ),
+            const SizedBox(height: 12),
+            SizedBox(
+              height: 38,
+              child: ListView.separated(
+                padding: const EdgeInsets.symmetric(horizontal: 20),
+                scrollDirection: Axis.horizontal,
+                itemCount: _taskStatusFilters.length,
+                separatorBuilder: (_, index) => const SizedBox(width: 8),
+                itemBuilder: (_, index) {
+                  final filter = _taskStatusFilters[index];
+                  final selected = state.statusFilter == filter.value;
+                  return ChoiceChip(
+                    label: Text(filter.label),
+                    selected: selected,
+                    onSelected: (_) {
+                      if (_scrollController.hasClients &&
+                          _scrollController.offset > 0) {
+                        _scrollController.jumpTo(0);
+                      }
+                      ref
+                          .read(taskProvider.notifier)
+                          .setStatusFilter(filter.value);
+                    },
+                    selectedColor: AppColors.primary.withAlpha(18),
+                    side: BorderSide(
+                      color: selected
+                          ? AppColors.primary.withAlpha(90)
+                          : AppColors.slate200,
+                    ),
+                    labelStyle: TextStyle(
+                      fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+                      // selectedColor 就是同一个 primary 的 alpha=18 淡底，
+                      // 标签再用满强度 primary 会和底色贴在一起。
+                      color: selected
+                          ? context.surfaces.tintFg(AppColors.primary)
+                          : null,
+                    ),
+                    visualDensity: VisualDensity.compact,
+                  );
+                },
+              ),
+            ),
+            const SizedBox(height: 10),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 20),
+              child: Row(
+                children: [
+                  Text(
+                    '共 ${state.total} 个任务',
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                  // 这一行现在最多要摆三个按钮，360dp 的窄屏放不下 ——
+                  // 用横向滚动兜住，而不是让 Row 溢出。reverse 保证内容不足一屏时
+                  // 仍然靠右，和改造前的 Spacer 观感一致。
+                  Expanded(
+                    child: SingleChildScrollView(
+                      scrollDirection: Axis.horizontal,
+                      reverse: true,
+                      child: Row(
+                        children: [
+                          if (_showViewFilterEntry(viewState, canManageViews))
+                            TextButton.icon(
+                              onPressed: _showViewPicker,
+                              icon: const Icon(
+                                Icons.filter_alt_outlined,
+                                size: 16,
+                              ),
+                              label: _buildFilterButtonLabel(
+                                _selectedViewName(state, viewState) ?? '全部任务',
+                              ),
+                            ),
+                          TextButton.icon(
+                            onPressed: _showGroupPicker,
+                            icon: const Icon(Icons.label_outline, size: 16),
+                            label: _buildFilterButtonLabel(
+                              state.labelFilter?.isNotEmpty == true
+                                  // 存的是完整标签 `分组:生产`，显示要去掉前缀。
+                                  ? Task.groupNameFromLabel(state.labelFilter!)
+                                  : '全部分组',
+                            ),
+                          ),
+                          if (state.statusFilter != null ||
+                              state.labelFilter != null ||
+                              state.selectedViewId != null)
+                            TextButton(
+                              onPressed: _clearTaskFilters,
+                              child: const Text('清除筛选'),
+                            ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            if (_selectionMode) ...[
+              Padding(
+                padding: const EdgeInsets.fromLTRB(20, 0, 20, 10),
+                child: SingleChildScrollView(
+                  scrollDirection: Axis.horizontal,
+                  child: Row(
+                    children: [
+                      AppTintedActionButton(
+                        label: allSelected ? '取消全选' : '全选',
+                        icon: allSelected ? Icons.deselect : Icons.select_all,
+                        color: AppColors.slate500,
+                        enabled: state.tasks.isNotEmpty,
+                        onTap: () => _toggleSelectAllTasks(state.tasks),
+                      ),
+                      const SizedBox(width: 8),
+                      AppTintedActionButton(
+                        label: '批量运行',
+                        icon: Icons.play_circle_outline,
+                        color: AppColors.primary,
+                        enabled: selectedCount > 0,
+                        onTap: () =>
+                            _performBatchTaskAction(_TaskBatchAction.run),
+                      ),
+                      const SizedBox(width: 8),
+                      AppTintedActionButton(
+                        label: '批量启用',
+                        icon: Icons.toggle_on_outlined,
+                        // 「启用」是 success 绿。原先它和左边的「批量运行」同为
+                        // primary，两个语义完全不同的动作长得一模一样。
+                        color: AppColors.success,
+                        enabled: selectedCount > 0,
+                        onTap: () =>
+                            _performBatchTaskAction(_TaskBatchAction.enable),
+                      ),
+                      const SizedBox(width: 8),
+                      AppTintedActionButton(
+                        label: '批量禁用',
+                        icon: Icons.toggle_off_outlined,
+                        color: AppColors.slate500,
+                        enabled: selectedCount > 0,
+                        onTap: () =>
+                            _performBatchTaskAction(_TaskBatchAction.disable),
+                      ),
+                      const SizedBox(width: 8),
+                      // 放在「批量删除」前面：删除是红色的破坏性动作，保持在最右。
+                      AppTintedActionButton(
+                        label: '通知设置',
+                        icon: Icons.notifications_outlined,
+                        color: AppColors.purple500,
+                        enabled: selectedCount > 0,
+                        onTap: _performBatchNotify,
+                      ),
+                      const SizedBox(width: 8),
+                      AppTintedActionButton(
+                        label: '批量删除',
+                        icon: Icons.delete_outline,
+                        color: AppColors.red500,
+                        enabled: selectedCount > 0,
+                        onTap: () =>
+                            _performBatchTaskAction(_TaskBatchAction.delete),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+            if (_taskSortMode) ...[
+              const Padding(
+                padding: EdgeInsets.fromLTRB(20, 0, 20, 10),
+                child: AppNotice(
+                  color: AppColors.primary,
+                  icon: Icons.swap_vert,
+                  text: '长按拖拽调整任务顺序，松手即保存',
+                  accentText: true,
+                ),
+              ),
+            ],
+            Expanded(
+              child: RefreshIndicator(
+                color: AppColors.primary,
+                onRefresh: () =>
+                    ref.read(taskProvider.notifier).load(refresh: true),
+                child: state.loading && state.tasks.isEmpty
+                    ? ListView(
+                        physics: const AlwaysScrollableScrollPhysics(),
+                        children: const [AppLoadingView()],
+                      )
+                    // TaskListState 一直有 error 字段，但从来没有被渲染过：
+                    // 拿不到数据和真的没有任务是两回事，必须先判 error。
+                    : state.error != null && state.tasks.isEmpty
+                    ? ListView(
+                        physics: const AlwaysScrollableScrollPhysics(),
+                        children: [
+                          AppErrorView(
+                            title: '任务加载失败',
+                            message: state.error!,
+                            onRetry: () =>
+                                ref.read(taskProvider.notifier).load(
+                                  refresh: true,
+                                ),
+                          ),
+                        ],
+                      )
+                    : state.tasks.isEmpty
+                    ? ListView(
+                        physics: const AlwaysScrollableScrollPhysics(),
+                        children: const [
+                          AppEmptyView(
+                            icon: Icons.inbox_outlined,
+                            message: '暂无任务',
+                            topPadding: 0,
+                          ),
+                        ],
+                      )
+                    : _taskSortMode
+                    ? _buildTaskReorderView(state.tasks)
+                    : _groupReorderMode
+                    ? _buildGroupReorderView(groupedTasks)
+                    // 改造前这里是 `ListView(children: 每组一个 Column)`：
+                    // Column 没有惰性布局，N 条任务就是 N 张重卡一次性建完，
+                    // 「未分组」用户更是只有 1 个孩子，sliver 惰性完全失效。
+                    // 换成按摊平后的行 index 构建，只有可见区域会被真正建出来。
+                    : ListView.builder(
+                        controller: _scrollController,
+                        physics: const AlwaysScrollableScrollPhysics(),
+                        padding: const EdgeInsets.fromLTRB(20, 0, 20, 100),
+                        itemCount: taskRows.length,
+                        itemBuilder: (context, index) {
+                          final row = taskRows[index];
+                          if (row.isGroupHeader) {
+                            return _buildGroupHeader(
+                              row.group,
+                              key: ValueKey(row.rowKey),
+                            );
+                          }
+                          return _buildTaskCard(
+                            row.task!,
+                            isLight,
+                            key: ValueKey(row.rowKey),
+                          );
+                        },
+                      ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _renameGroup(String oldName, List<Task> tasks) async {
+    final controller = TextEditingController(text: oldName);
+    final newName = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('重命名分组'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          decoration: const InputDecoration(
+            labelText: '分组名称',
+            hintText: '输入新的分组名称',
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('取消'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, controller.text.trim()),
+            child: const Text('确定'),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+    if (newName == null || newName.isEmpty || newName == oldName) return;
+    try {
+      await ref
+          .read(taskProvider.notifier)
+          .batchUpdateGroupLabel(
+            tasks: tasks,
+            oldGroupName: oldName,
+            newGroupName: newName,
+          );
+      if (mounted) {
+        _showSuccess('已将分组 "$oldName" 重命名为 "$newName"');
+      }
+    } catch (error) {
+      if (mounted) {
+        await _showActionError(error, '重命名分组失败');
+      }
+    }
+  }
+
+  Future<void> _deleteGroup(String groupName, List<Task> tasks) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('删除分组'),
+        content: Text('确定将 "$groupName" 分组中的 ${tasks.length} 个任务移回未分组？'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('确定', style: TextStyle(color: Colors.red)),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    try {
+      await ref
+          .read(taskProvider.notifier)
+          .batchUpdateGroupLabel(
+            tasks: tasks,
+            oldGroupName: groupName,
+            newGroupName: null,
+          );
+      if (mounted) {
+        _showSuccess('已删除分组 "$groupName"');
+      }
+    } catch (error) {
+      if (mounted) {
+        await _showActionError(error, '删除分组失败');
+      }
+    }
+  }
+
+  Future<void> _addTasksToGroup(
+    String targetGroup,
+    List<Task> ungroupedTasks,
+  ) async {
+    if (ungroupedTasks.isEmpty) {
+      // 「没有可添加的」既不是成功也不是失败，只是没什么可干，保持中性。
+      _showMessage('没有未分组的任务可添加');
+      return;
+    }
+    final selected = <int>{};
+    await showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDialogState) => AlertDialog(
+          title: Text('添加任务到 "$targetGroup"'),
+          content: SizedBox(
+            width: double.maxFinite,
+            height: 400,
+            child: ListView.builder(
+              itemCount: ungroupedTasks.length,
+              itemBuilder: (ctx, i) {
+                final task = ungroupedTasks[i];
+                return CheckboxListTile(
+                  value: selected.contains(task.id),
+                  title: Text(task.name, style: const TextStyle(fontSize: 14)),
+                  dense: true,
+                  onChanged: (v) {
+                    setDialogState(() {
+                      if (v == true) {
+                        selected.add(task.id);
+                      } else {
+                        selected.remove(task.id);
+                      }
+                    });
+                  },
+                );
+              },
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('取消'),
+            ),
+            TextButton(
+              onPressed: () async {
+                Navigator.pop(ctx);
+                if (selected.isEmpty) return;
+                final tasksToMove = ungroupedTasks
+                    .where((t) => selected.contains(t.id))
+                    .toList();
+                try {
+                  await ref
+                      .read(taskProvider.notifier)
+                      .batchUpdateGroupLabel(
+                        tasks: tasksToMove,
+                        oldGroupName: null,
+                        newGroupName: targetGroup,
+                      );
+                  if (mounted) {
+                    _showSuccess(
+                      '已将 ${tasksToMove.length} 个任务添加到 "$targetGroup"',
+                    );
+                  }
+                } catch (error) {
+                  if (mounted) {
+                    await _showActionError(error, '添加任务到分组失败');
+                  }
+                }
+              },
+              child: Text('添加 (${selected.length})'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _showCreateGroupFromUngrouped(List<Task> ungroupedTasks) async {
+    final nameController = TextEditingController();
+    final selected = <int>{};
+    await showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDialogState) => AlertDialog(
+          title: const Text('新建分组'),
+          content: SizedBox(
+            width: double.maxFinite,
+            height: 450,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                TextField(
+                  controller: nameController,
+                  autofocus: true,
+                  decoration: const InputDecoration(
+                    labelText: '分组名称',
+                    hintText: '输入新分组的名称',
+                  ),
+                ),
+                const SizedBox(height: 16),
+                const Text(
+                  '选择要加入的任务:',
+                  style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+                ),
+                const SizedBox(height: 8),
+                Expanded(
+                  child: ListView.builder(
+                    itemCount: ungroupedTasks.length,
+                    itemBuilder: (ctx, i) {
+                      final task = ungroupedTasks[i];
+                      return CheckboxListTile(
+                        value: selected.contains(task.id),
+                        title: Text(
+                          task.name,
+                          style: const TextStyle(fontSize: 14),
+                        ),
+                        dense: true,
+                        onChanged: (v) {
+                          setDialogState(() {
+                            if (v == true) {
+                              selected.add(task.id);
+                            } else {
+                              selected.remove(task.id);
+                            }
+                          });
+                        },
+                      );
+                    },
+                  ),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('取消'),
+            ),
+            TextButton(
+              onPressed: () async {
+                final groupName = nameController.text.trim();
+                Navigator.pop(ctx);
+                if (groupName.isEmpty || selected.isEmpty) return;
+                final tasksToMove = ungroupedTasks
+                    .where((t) => selected.contains(t.id))
+                    .toList();
+                try {
+                  await ref
+                      .read(taskProvider.notifier)
+                      .batchUpdateGroupLabel(
+                        tasks: tasksToMove,
+                        oldGroupName: null,
+                        newGroupName: groupName,
+                      );
+                  if (mounted) {
+                    _showSuccess(
+                      '已创建分组 "$groupName" 并添加 ${tasksToMove.length} 个任务',
+                    );
+                  }
+                } catch (error) {
+                  if (mounted) {
+                    await _showActionError(error, '创建分组失败');
+                  }
+                }
+              },
+              child: const Text('创建'),
+            ),
+          ],
+        ),
+      ),
+    );
+    nameController.dispose();
+  }
+
+  Widget _buildGroupReorderView(List<TaskGroup> groups) {
+    return Column(
+      children: [
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
+          child: Row(
+            children: [
+              const Icon(Icons.swap_vert, size: 18),
+              const SizedBox(width: 8),
+              const Expanded(
+                child: Text(
+                  '长按拖拽调整分组顺序',
+                  style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+                ),
+              ),
+              TextButton(
+                onPressed: () => setState(() => _groupReorderMode = false),
+                child: const Text('完成'),
+              ),
+            ],
+          ),
+        ),
+        Expanded(
+          child: ReorderableListView.builder(
+            padding: const EdgeInsets.fromLTRB(20, 0, 20, 100),
+            itemCount: groups.length,
+            onReorder: (oldIndex, newIndex) {
+              setState(() {
+                if (newIndex > oldIndex) newIndex--;
+                final item = groups.removeAt(oldIndex);
+                groups.insert(newIndex, item);
+                _groupOrder = groups.map((g) => g.key).toList();
+              });
+              _persistGroupOrder();
+            },
+            itemBuilder: (ctx, i) {
+              final group = groups[i];
+              // ⚠️ key 必须挂在 ReorderableListView 的直接子 widget 上（这里就是
+              // AppCard 自己），挂到它的 child 上会在拖拽时抛
+              // 「Every item of ReorderableListView must have a key」。
+              return AppCard(
+                key: ValueKey(group.key),
+                margin: const EdgeInsets.only(bottom: 8),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 14,
+                  vertical: 14,
+                ),
+                child: Row(
+                  children: [
+                    const Icon(
+                      Icons.drag_handle,
+                      size: 20,
+                      color: AppColors.slate400,
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Text(
+                        group.title,
+                        style: const TextStyle(
+                          fontSize: 14,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ),
+                    Text(
+                      '${group.tasks.length} 条',
+                      style: const TextStyle(
+                        fontSize: 12,
+                        color: AppColors.slate400,
+                      ),
+                    ),
+                  ],
+                ),
+              );
+            },
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildTaskReorderView(List<Task> tasks) {
+    return ReorderableListView.builder(
+      padding: const EdgeInsets.fromLTRB(20, 0, 20, 100),
+      itemCount: tasks.length,
+      onReorder: (oldIndex, newIndex) async {
+        // 松手即保存，一次拖拽只发一次 PUT /tasks/sort（面板按落点把整桶重编号）。
+        // 不再攒到「完成」时逐条提交：那样 N 条任务要发 N 个请求，而且写的是开机顺序 sort_order。
+        // 失败时 provider 已按服务端顺序把列表弹回去，这里只负责把原因（跨区提示 / 请升级）说出来。
+        // 进排序模式时拦过一次，但排序模式里列表还会刷新（每次松手后、下拉刷新、切状态筛选），
+        // 刷出运行中的任务后就得在这里再拦；不调 moveTask，被拖的那条自然弹回原位。
+        final reason = ref.read(taskProvider).dragSortDisabledReason;
+        if (reason != null) {
+          _showWarning(reason);
+          return;
+        }
+        try {
+          await ref.read(taskProvider.notifier).moveTask(oldIndex, newIndex);
+        } catch (error) {
+          await _showActionError(error, '保存任务排序失败');
+        }
+      },
+      itemBuilder: (context, index) {
+        final task = tasks[index];
+        // ⚠️ key 必须挂在 ReorderableListView 的直接子 widget 上（这里就是
+        // AppCard 自己），挂到它的 child 上会在拖拽时抛
+        // 「Every item of ReorderableListView must have a key」。
+        return AppCard(
+          key: ValueKey('task-sort-${task.id}'),
+          margin: const EdgeInsets.only(bottom: 8),
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
+          child: Row(
+            children: [
+              const Icon(
+                Icons.drag_handle,
+                size: 20,
+                color: AppColors.slate400,
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      task.name,
+                      style: const TextStyle(
+                        fontSize: 14,
+                        fontWeight: FontWeight.w700,
+                      ),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      task.groupName?.isNotEmpty == true
+                          ? '分组：${task.groupName}'
+                          : '未分组',
+                      style: const TextStyle(
+                        fontSize: 11,
+                        color: AppColors.slate400,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              // 与详情页那颗徽章（:2566）用同一条判断：不认识的状态按「非活跃」
+              // 渲染。只改文案不改高亮的话，面板新增的状态在排序视图里仍会亮成
+              // 一个活跃态徽章，而我们并不知道那个新状态到底是不是活跃的。
+              _MetaChip(
+                label: task.statusText,
+                active: task.hasKnownStatus && !task.isDisabled,
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  /// 可折叠的分组头。
+  ///
+  /// 只有 `buildTaskListRows` 产出分组头行时才会被调用：
+  /// `groupTasksByGroupName` 永远至少产出一个桶（没设分组的任务全部落进 key 为空的
+  /// 「未分组」桶），所以分组头以前是**无条件**渲染的：一个从来没用过分组功能的
+  /// 用户，屏幕顶部固定被一条 60.9dp 的「未分组 · N 条」占掉，而这条信息与头部
+  /// 已有的「共 N 个任务」完全重复，且折叠它等于把整页任务藏起来，毫无用处。
+  /// 这是任务列表每屏只能完整显示 1 张卡的首要原因，比卡片内边距重要得多。
+  Widget _buildGroupHeader(TaskGroup group, {Key? key}) {
+    final collapsed = _collapsedGroups.contains(group.key);
+    final enabledCount = group.tasks.where((task) => task.isEnabled).length;
+    final runningCount = group.tasks.where((task) => task.isRunning).length;
+    final isUngrouped = group.key.isEmpty;
+
+    return AppCard(
+      key: key,
+      margin: const EdgeInsets.only(bottom: 6),
+      // 纵向内边距只降到 10：整条分组头就是它自己的点击区，
+      // 再往下压（12→8）会让这个点击目标掉到 44.9dp，低于 48dp 下限。
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      onTap: () {
+        setState(() {
+          if (collapsed) {
+            _collapsedGroups.remove(group.key);
+          } else {
+            _collapsedGroups.add(group.key);
+          }
+        });
+        _persistCollapsedGroups();
+      },
+      onLongPress: () {
+        HapticFeedback.mediumImpact();
+        setState(() => _groupReorderMode = true);
+      },
+      child: Row(
+        children: [
+          Icon(
+            collapsed ? Icons.chevron_right : Icons.expand_more,
+            size: 20,
+            color: AppColors.slate400,
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              group.title,
+              style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w700),
+            ),
+          ),
+          Text(
+            '${group.tasks.length} 条',
+            style: TextStyle(
+              fontSize: 12,
+              color: Theme.of(context).colorScheme.onSurfaceVariant,
+            ),
+          ),
+          const SizedBox(width: 10),
+          if (runningCount > 0)
+            _MetaChip(label: '$runningCount 运行中', active: true)
+          else
+            _MetaChip(label: '$enabledCount 已启用', active: enabledCount > 0),
+          const SizedBox(width: 4),
+          _GroupPopupMenu(
+            isUngrouped: isUngrouped,
+            onRename: isUngrouped
+                ? null
+                : () => _renameGroup(group.key, group.tasks),
+            onDelete: isUngrouped
+                ? null
+                : () => _deleteGroup(group.key, group.tasks),
+            onAddTasks: () {
+              final allTasks = ref.read(taskProvider).tasks;
+              final ungrouped = allTasks
+                  .where((t) => (t.groupName ?? '').isEmpty)
+                  .toList();
+              final targetGroup = isUngrouped ? null : group.key;
+              if (targetGroup == null) {
+                _showCreateGroupFromUngrouped(ungrouped);
+              } else {
+                _addTasksToGroup(targetGroup, ungrouped);
+              }
+            },
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 单张任务卡。[key] 由摊平行的 `rowKey` 提供（`task-card-<id>`），
+  /// 虚拟化后 Element 会被回收复用，没有这个 key 侧滑展开状态会串到别的任务上。
+  Widget _buildTaskCard(Task task, bool isLight, {Key? key}) {
+    return _TaskCard(
+      key: key,
+      task: task,
+      isLight: isLight,
+      selectionMode: _selectionMode,
+      selected: _selectedTaskIds.contains(task.id),
+      // 非多选模式下点卡片进任务详情页（issue #20）；原来的「点卡片看最新日志」挪到详情页的「最新日志」行
+      onTap: () => _selectionMode
+          ? _toggleTaskSelection(task.id)
+          : context.push('/tasks/${task.id}/detail', extra: task),
+      onLongPress: () {
+        HapticFeedback.mediumImpact();
+        _toggleTaskSelection(task.id);
+      },
+      onSelectedChanged: () => _toggleTaskSelection(task.id),
+      onRun: () => _runTask(task),
+      onStop: () => _stopTask(task),
+      onToggleEnabled: () => _toggleTaskEnabled(task),
+      onCopy: () => _copyTask(task),
+      onTogglePinned: () => _togglePinned(task),
+      onEdit: () => context.push('/tasks/edit', extra: task),
+      onDelete: () => _confirmDelete(task),
+      onViewLog: () => openLatestTaskLog(context, ref, task),
+    );
+  }
+
+  Future<void> _confirmDelete(Task task) async {
+    await confirmAndDeleteTask(context, ref, task);
+  }
+}
+
+/// 删除任务：确认弹窗（可勾选同时删除关联脚本）→ 删除 → 提示。
+/// 列表侧滑和任务详情页（issue #20）共用这一份；返回是否真的删掉了任务，详情页据此返回列表。
+Future<bool> confirmAndDeleteTask(
+  BuildContext context,
+  WidgetRef ref,
+  Task task,
+) async {
+  final scriptPath = extractScriptPathFromCommand(task.command);
+  var deleteScript = false;
+  final confirm = await showDialog<bool>(
+    context: context,
+    builder: (dialogContext) => StatefulBuilder(
+      builder: (context, setDialogState) => AlertDialog(
+        title: const Text('删除任务'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('确定要删除「${task.name}」吗？'),
+            if (scriptPath != null) ...[
+              const SizedBox(height: 14),
+              CheckboxListTile(
+                value: deleteScript,
+                contentPadding: EdgeInsets.zero,
+                dense: true,
+                controlAffinity: ListTileControlAffinity.leading,
+                title: const Text('同时删除关联脚本'),
+                subtitle: Text(scriptPath),
+                onChanged: (value) {
+                  setDialogState(() => deleteScript = value ?? false);
+                },
+              ),
+            ],
+          ],
+        ),
+        actions: [
+          Row(
+            children: [
+              Expanded(
+                child: SizedBox(
+                  height: 44,
+                  child: OutlinedButton(
+                    onPressed: () => Navigator.pop(dialogContext, false),
+                    child: const Text('取消'),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: SizedBox(
+                  height: 44,
+                  child: FilledButton(
+                    onPressed: () => Navigator.pop(dialogContext, true),
+                    style: FilledButton.styleFrom(
+                      backgroundColor: AppColors.red500,
+                    ),
+                    child: const Text('删除'),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    ),
+  );
+  if (confirm != true || !context.mounted) {
+    return false;
+  }
+  try {
+    await ref.read(taskProvider.notifier).deleteTask(task.id);
+    if (deleteScript && scriptPath != null) {
+      try {
+        await DioClient.instance.dio.delete(
+          ApiEndpoints.scripts,
+          queryParameters: {'path': scriptPath, 'type': 'file'},
+        );
+        if (context.mounted) AppSnack.success(context, '任务和关联脚本已删除');
+      } catch (error) {
+        // 部分成功：任务删掉了、脚本没删掉。既不能报绿也不能报红。
+        if (context.mounted) {
+          AppSnack.warn(
+            context,
+            '任务已删除，但脚本删除失败：${extractErrorMessage(error, '请稍后手动删除脚本')}',
+          );
+        }
+      }
+      return true;
+    }
+    if (context.mounted) AppSnack.success(context, '任务已删除');
+    return true;
+  } catch (error) {
+    if (context.mounted) {
+      AppSnack.error(context, _extractTaskError(error, '删除任务失败'));
+    }
+    return false;
+  }
+}
+
+/// 打开任务日志：运行中开实时日志，否则打开最近一次日志。
+/// v1.4.2 起点卡片改进详情页（issue #20），看日志要多点一层；APP #22 评论要求在
+/// 列表左滑里补一个「日志」，和详情页的「最新日志」行共用这一份，两处行为不会走样。
+Future<void> openLatestTaskLog(
+  BuildContext context,
+  WidgetRef ref,
+  Task task,
+) async {
+  if (task.isRunning) {
+    context.push('/tasks/${task.id}/live-logs', extra: task.name);
+    return;
+  }
+  try {
+    final latestLog = await ref
+        .read(taskProvider.notifier)
+        .fetchLatestLog(task.id);
+    if (!context.mounted) return;
+    if (latestLog == null) {
+      AppSnack.show(context, '当前任务暂无日志');
+      return;
+    }
+    context.push('/logs/${latestLog.id}/stream');
+  } catch (_) {
+    if (context.mounted) AppSnack.error(context, '打开日志失败');
+  }
+}
+
+class _TaskCard extends StatefulWidget {
+  final Task task;
+  final bool isLight;
+  final bool selectionMode;
+  final bool selected;
+  final VoidCallback onTap;
+  final VoidCallback onLongPress;
+  final VoidCallback onSelectedChanged;
+  final VoidCallback onRun;
+  final VoidCallback onStop;
+  final VoidCallback onToggleEnabled;
+  final VoidCallback onCopy;
+  final VoidCallback onTogglePinned;
+  final VoidCallback onEdit;
+  final VoidCallback onDelete;
+  final VoidCallback onViewLog;
+
+  const _TaskCard({
+    super.key,
+    required this.task,
+    required this.isLight,
+    required this.selectionMode,
+    required this.selected,
+    required this.onTap,
+    required this.onLongPress,
+    required this.onSelectedChanged,
+    required this.onRun,
+    required this.onStop,
+    required this.onToggleEnabled,
+    required this.onCopy,
+    required this.onTogglePinned,
+    required this.onEdit,
+    required this.onDelete,
+    required this.onViewLog,
+  });
+
+  @override
+  State<_TaskCard> createState() => _TaskCardState();
+}
+
+class _TaskCardState extends State<_TaskCard> {
+  // 左滑按钮的宽度上限（宽屏时的原尺寸）。
+  static const double _actionMaxWidth = 52;
+  static const double _actionGap = 6;
+  static const int _actionCount = 6;
+
+  /// 左滑全部展开后，卡片左侧至少还要露出来的宽度：一点都不露，用户看不出这是哪张卡、也没处点「收起」。
+  static const double _cardPeekWidth = 16;
+
+  double _dragOffset = 0;
+  bool _dragging = false;
+
+  Task get task => widget.task;
+
+  @override
+  void didUpdateWidget(covariant _TaskCard oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.selectionMode || oldWidget.task.id != widget.task.id) {
+      _dragOffset = 0;
+      _dragging = false;
+    }
+  }
+
+  // 四态配色：运行中=蓝(info/主色)、排队中=琥珀(warning)、失败=红(danger)、
+  // 已启用=绿(success)、已禁用=灰。改造前「运行中」与「已启用」都取 primary，
+  // 主色换蓝后两者彻底同色，这里把「已启用」还给绿色语义。
+  Color _dotColor() {
+    if (task.isRunning) {
+      return AppColors.info;
+    }
+    if (task.isQueued) {
+      return AppColors.warning;
+    }
+    // 只有 last_run_status == 1 才是失败。2 是用户主动终止（面板 RunAborted），
+    // 不该亮红点去催人排查一个自己按下的停止键。
+    if (task.lastRunFailed) {
+      return AppColors.danger;
+    }
+    if (task.isEnabled) {
+      return AppColors.success;
+    }
+    return AppColors.slate300;
+  }
+
+  String _statusLabel() => task.statusText;
+
+  Color _statusBg() {
+    if (task.isRunning) {
+      return widget.isLight
+          ? AppColors.infoLight
+          : AppColors.info.withAlpha(25);
+    }
+    if (task.isQueued) {
+      return AppColors.warning.withAlpha(widget.isLight ? 18 : 25);
+    }
+    if (task.isEnabled) {
+      return widget.isLight
+          ? AppColors.successLight
+          : AppColors.success.withAlpha(25);
+    }
+    return widget.isLight ? AppColors.slate100 : AppColors.slate800;
+  }
+
+  Color _statusFg() {
+    if (task.isRunning) {
+      return widget.isLight ? AppColors.infoDark : AppColors.info;
+    }
+    if (task.isQueued) {
+      // 「排队中」是全部徽章里最淡的一个：琥珀色压在自己的 alpha=18 淡底上
+      // 只有 2.04:1。另外三个分支浅色下已经各自用了 *Dark，这里补齐。
+      return (widget.isLight ? AppSurfaces.light : AppSurfaces.dark)
+          .tintFg(AppColors.warning);
+    }
+    if (task.isEnabled) {
+      return widget.isLight ? AppColors.successDark : AppColors.success;
+    }
+    return AppColors.neutral;
+  }
+
+  String _taskTypeLabel() => task.taskTypeText;
+
+  List<String> _scheduleExpressions() {
+    if (task.cronExpressions.isNotEmpty) {
+      return task.cronExpressions;
+    }
+    if (task.cronExpression.trim().isNotEmpty) {
+      return [task.cronExpression.trim()];
+    }
+    return const [];
+  }
+
+  String _bottomText() {
+    if (task.isRunning) {
+      return '点击查看实时日志';
+    }
+    if (task.lastRunFailed && task.lastRunAt != null) {
+      return '上次失败：${formatTimeCn(task.lastRunAt, short: true)}';
+    }
+    if (task.nextRunAt != null) {
+      return '下次运行：${formatTimeCn(task.nextRunAt, short: true)}';
+    }
+    if (task.taskType == 'manual') {
+      return '手动触发';
+    }
+    if (task.taskType == 'startup') {
+      return '面板启动时自动执行';
+    }
+    return '暂无计划';
+  }
+
+  void _closeActions() {
+    if (_dragOffset == 0) {
+      return;
+    }
+    setState(() => _dragOffset = 0);
+  }
+
+  void _runSwipeAction(VoidCallback action) {
+    _closeActions();
+    action();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final dotColor = _dotColor();
+    final borderColor = widget.isLight
+        ? AppColors.slate200
+        : AppColors.slate800;
+    final labels = task.userLabelsForDisplay;
+    final hasFailure = task.lastRunFailed;
+    final primaryColor = task.isRunning ? AppColors.red500 : AppColors.primary;
+
+    return PopScope(
+      canPop: _dragOffset == 0,
+      onPopInvokedWithResult: (didPop, _) {
+        if (didPop || _dragOffset == 0) {
+          return;
+        }
+        // 侧滑按钮展开时，系统返回先收起按钮，避免用户回滑时误退出 APP。
+        _closeActions();
+      },
+      child: Container(
+        margin: const EdgeInsets.only(bottom: 8),
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            // APP #22 评论：左滑加了第 6 个「日志」，6 个 52dp 的按钮在 360dp 屏（卡片约 320dp 宽）上放不下。
+            // 按卡片实际宽度均分：宽屏仍是 52，窄屏收窄但不低于 44dp 命中区；
+            // 拖动上限、吸附阈值都用这同一个总宽，展开距离与按钮总宽始终一致。
+            final actionWidth =
+                ((constraints.maxWidth -
+                            8 -
+                            _actionGap * (_actionCount - 1) -
+                            _cardPeekWidth) /
+                        _actionCount)
+                    .clamp(AppTapTarget.min, _actionMaxWidth)
+                    .toDouble();
+            final actionsWidth =
+                actionWidth * _actionCount +
+                _actionGap * (_actionCount - 1) +
+                8;
+            // 转屏 / 分屏后总宽可能变小，已展开的偏移不能超出新的总宽。
+            final dragOffset = _dragOffset.clamp(-actionsWidth, 0.0).toDouble();
+            return Stack(
+              clipBehavior: Clip.none,
+              children: [
+                Positioned.fill(
+                  child: Align(
+                    alignment: Alignment.centerRight,
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        _TaskSwipeActionButton(
+                          // APP #22 评论：v1.4.2 起点卡片进详情页，看日志多了一层，这里补回一个直达入口。
+                          label: '日志',
+                          icon: Icons.receipt_long_outlined,
+                          color: AppColors.purple500,
+                          width: actionWidth,
+                          onTap: () => _runSwipeAction(widget.onViewLog),
+                        ),
+                        const SizedBox(width: _actionGap),
+                        _TaskSwipeActionButton(
+                          // 开关位一律看 isSwitchOn，不看 status：禁用任务被手动运行时
+                          // status 是 0.5 / 2，按 isDisabled 判会把它说成开着、按钮写
+                          // 「禁用」（面板 #133 同款）。文案 / 图标 / 颜色三处同一个判断。
+                          label: task.switchActionLabel,
+                          icon: task.isSwitchOn
+                              ? Icons.pause_circle_outline
+                              : Icons.play_circle_outline,
+                          // 「启用」是把任务切到已启用态，语义是 success 绿，
+                          // 和同卡状态圆点 / 徽章的「已启用」保持同色；
+                          // 原先取 primary，与「运行」类动作撞成同一个蓝。
+                          // 淡底与前景都由 _TaskSwipeActionButton 内部按这个 color
+                          // 推导（含 tintFg），这里改一处即可。
+                          color: task.isSwitchOn
+                              ? AppColors.slate500
+                              : AppColors.success,
+                          width: actionWidth,
+                          onTap: () => _runSwipeAction(widget.onToggleEnabled),
+                        ),
+                        const SizedBox(width: _actionGap),
+                        _TaskSwipeActionButton(
+                          label: task.isPinned ? '取消' : '置顶',
+                          icon: task.isPinned
+                              ? Icons.push_pin_outlined
+                              : Icons.push_pin,
+                          color: AppColors.amber500,
+                          width: actionWidth,
+                          onTap: () => _runSwipeAction(widget.onTogglePinned),
+                        ),
+                        const SizedBox(width: _actionGap),
+                        _TaskSwipeActionButton(
+                          label: '复制',
+                          icon: Icons.copy_outlined,
+                          color: AppColors.blue500,
+                          width: actionWidth,
+                          onTap: () => _runSwipeAction(widget.onCopy),
+                        ),
+                        const SizedBox(width: _actionGap),
+                        _TaskSwipeActionButton(
+                          label: '编辑',
+                          icon: Icons.edit_outlined,
+                          color: AppColors.slate500,
+                          width: actionWidth,
+                          onTap: () => _runSwipeAction(widget.onEdit),
+                        ),
+                        const SizedBox(width: _actionGap),
+                        _TaskSwipeActionButton(
+                          label: '删除',
+                          icon: Icons.delete_outline,
+                          color: AppColors.red500,
+                          width: actionWidth,
+                          onTap: () => _runSwipeAction(widget.onDelete),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                GestureDetector(
+                  onTap: () {
+                    if (_dragOffset != 0) {
+                      _closeActions();
+                      return;
+                    }
+                    widget.onTap();
+                  },
+                  onLongPress: widget.onLongPress,
+                  onHorizontalDragStart: widget.selectionMode
+                      ? null
+                      : (_) => setState(() => _dragging = true),
+                  onHorizontalDragUpdate: widget.selectionMode
+                      ? null
+                      : (details) {
+                          // 左滑露出右侧次要操作；关闭时也限制在卡片内处理，避免和系统返回手势抢动作。
+                          final nextOffset = (_dragOffset + details.delta.dx)
+                              .clamp(-actionsWidth, 0.0)
+                              .toDouble();
+                          if (nextOffset == _dragOffset) {
+                            return;
+                          }
+                          setState(() => _dragOffset = nextOffset);
+                        },
+                  onHorizontalDragCancel: widget.selectionMode
+                      ? null
+                      : () => setState(() => _dragging = false),
+                  onHorizontalDragEnd: widget.selectionMode
+                      ? null
+                      : (_) {
+                          final nextOffset =
+                              _dragOffset.abs() > actionsWidth * 0.42
+                              ? -actionsWidth
+                              : 0.0;
+                          setState(() {
+                            _dragging = false;
+                            _dragOffset = nextOffset;
+                          });
+                          if (nextOffset == -actionsWidth) {
+                            HapticFeedback.selectionClick();
+                          }
+                        },
+                  child: AnimatedContainer(
+                    duration: _dragging
+                        ? Duration.zero
+                        : const Duration(milliseconds: 160),
+                    curve: Curves.easeOutCubic,
+                    transform: Matrix4.translationValues(dragOffset, 0, 0),
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: widget.isLight ? Colors.white : AppColors.slate900,
+                      // 列表项卡片。这一处没迁 AppCard（要 AnimatedContainer +
+                      // Matrix4 做左滑），但圆角必须与 AppCard 同档。
+                      borderRadius: BorderRadius.circular(AppRadius.lg),
+                      border: Border.all(
+                        color: widget.selected
+                            ? AppColors.primary
+                            : (hasFailure
+                                  ? AppColors.red500.withAlpha(60)
+                                  : borderColor),
+                        width: widget.selected ? 1.4 : 1,
+                      ),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            if (widget.selectionMode) ...[
+                              SizedBox(
+                                width: 24,
+                                height: 24,
+                                child: Checkbox(
+                                  value: widget.selected,
+                                  onChanged: (_) => widget.onSelectedChanged(),
+                                  activeColor: AppColors.primary,
+                                  visualDensity: VisualDensity.compact,
+                                  materialTapTargetSize:
+                                      MaterialTapTargetSize.shrinkWrap,
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                            ],
+                            Container(
+                              width: 8,
+                              height: 8,
+                              decoration: BoxDecoration(
+                                color: dotColor,
+                                shape: BoxShape.circle,
+                              ),
+                            ),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: Text(
+                                task.name,
+                                style: const TextStyle(
+                                  fontSize: 14,
+                                  fontWeight: FontWeight.w700,
+                                ),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                            if (task.isPinned)
+                              const Padding(
+                                padding: EdgeInsets.only(right: 6),
+                                child: Icon(
+                                  Icons.push_pin,
+                                  size: 14,
+                                  color: AppColors.amber500,
+                                ),
+                              ),
+                            Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 8,
+                                vertical: 3,
+                              ),
+                              decoration: BoxDecoration(
+                                color: _statusBg(),
+                                borderRadius: BorderRadius.circular(AppRadius.pill),
+                              ),
+                              child: Text(
+                                _statusLabel(),
+                                style: TextStyle(
+                                  fontSize: 10,
+                                  fontWeight: FontWeight.w700,
+                                  color: _statusFg(),
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 8),
+                        _TaskScheduleSummary(
+                          taskType: task.taskType,
+                          taskTypeLabel: _taskTypeLabel(),
+                          expressions: _scheduleExpressions(),
+                          isLight: widget.isLight,
+                        ),
+                        if (labels.isNotEmpty) ...[
+                          const SizedBox(height: 8),
+                          _TaskSubscriptionSummary(
+                            labels: labels,
+                            isLight: widget.isLight,
+                          ),
+                        ],
+                        const SizedBox(height: 8),
+                        Row(
+                          children: [
+                            Expanded(
+                              child: Text(
+                                _bottomText(),
+                                style: TextStyle(
+                                  fontSize: 11,
+                                  color: hasFailure
+                                      ? AppColors.red500
+                                      : (widget.isLight
+                                            ? AppColors.slate400
+                                            : AppColors.slate500),
+                                ),
+                              ),
+                            ),
+                            if (!widget.selectionMode) ...[
+                              _TaskPrimaryActionButton(
+                                label: task.isRunning ? '停止' : '运行',
+                                icon: task.isRunning
+                                    ? Icons.stop_rounded
+                                    : Icons.play_arrow_rounded,
+                                color: primaryColor,
+                                onTap: task.isRunning
+                                    ? widget.onStop
+                                    : widget.onRun,
+                              ),
+                              const SizedBox(width: 8),
+                              const Icon(
+                                Icons.swipe_left_alt_rounded,
+                                size: 18,
+                                color: AppColors.slate400,
+                              ),
+                            ],
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ],
+            );
+          },
+        ),
+      ),
+    );
+  }
+}
+
+class _TaskPrimaryActionButton extends StatelessWidget {
+  final String label;
+  final IconData icon;
+  final Color color;
+  final VoidCallback onTap;
+
+  const _TaskPrimaryActionButton({
+    required this.label,
+    required this.icon,
+    required this.color,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final surfaces = AppSurfaces.of(context);
+    final isLight = surfaces.isLight;
+    // 底色就是同一个 color 的淡底，前景必须加深，否则「运行 / 停止」两个
+    // 主操作按钮在浅色下最高只有 2.6:1。
+    final fg = surfaces.tintFg(color);
+    return Material(
+      color: color.withAlpha(isLight ? 22 : 34),
+      // 底板与水波纹必须同值，否则波纹会溢出胶囊的两个圆头。
+      borderRadius: BorderRadius.circular(AppRadius.pill),
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(AppRadius.pill),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(icon, size: 16, color: fg),
+              const SizedBox(width: 4),
+              Text(
+                label,
+                style: TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w700,
+                  color: fg,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _TaskSwipeActionButton extends StatelessWidget {
+  final String label;
+  final IconData icon;
+  final Color color;
+  final VoidCallback onTap;
+
+  /// 由卡片按实际宽度算出来（APP #22 评论：6 个按钮要在 360dp 屏放得下）。
+  final double width;
+
+  const _TaskSwipeActionButton({
+    required this.label,
+    required this.icon,
+    required this.color,
+    required this.width,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final surfaces = AppSurfaces.of(context);
+    final isLight = surfaces.isLight;
+    // 侧滑按钮的 10px 文字压在同色淡底上，是全库最小的那一档文字。
+    final fg = surfaces.tintFg(color);
+    return SizedBox(
+      width: width,
+      child: Material(
+        color: color.withAlpha(isLight ? 22 : 34),
+        // 左滑露出的操作按钮，走按钮档；底板与水波纹必须同值。
+        borderRadius: BorderRadius.circular(AppRadius.md),
+        child: InkWell(
+          onTap: onTap,
+          borderRadius: BorderRadius.circular(AppRadius.md),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(icon, size: 17, color: fg),
+              const SizedBox(height: 4),
+              Text(
+                label,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  fontSize: 10,
+                  fontWeight: FontWeight.w700,
+                  color: fg,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _TaskScheduleSummary extends StatelessWidget {
+  final String taskType;
+  final String taskTypeLabel;
+  final List<String> expressions;
+  final bool isLight;
+
+  const _TaskScheduleSummary({
+    required this.taskType,
+    required this.taskTypeLabel,
+    required this.expressions,
+    required this.isLight,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final isCron = taskType == 'cron';
+    final cleanExpressions = expressions
+        .map((item) => item.trim())
+        .where((item) => item.isNotEmpty)
+        .toList();
+    final title = isCron
+        ? (cleanExpressions.length > 1
+              ? 'Cron 定时 · ${cleanExpressions.length} 条'
+              : 'Cron 定时')
+        : taskTypeLabel;
+    final value = isCron
+        ? (cleanExpressions.isEmpty ? '暂无定时规则' : cleanExpressions.first)
+        : (taskType == 'manual' ? '手动触发运行' : '面板启动时自动执行');
+    final icon = isCron
+        ? Icons.schedule_rounded
+        : taskType == 'manual'
+        ? Icons.touch_app_outlined
+        : Icons.power_settings_new_rounded;
+    final color = isCron
+        ? AppColors.primary
+        : taskType == 'manual'
+        ? AppColors.blue500
+        : AppColors.amber500;
+
+    // 这里原本是「带边框的盒子套在带边框的卡片里」：任务卡自己已经有 1px 边框，
+    // 里面再套一层 slate50 底 + slate200 边 + 12 圆角，只为了圈住两行排期文字。
+    // 去掉这层框之后，左侧 28dp 的着色图标块仍然是足够强的分区锚点，
+    // 「标题 + 值」的两级排版也没变，信息一条没少；卡片纵向省下 20dp
+    //（上下各 9dp 内边距 + 2dp 边框），并且图标块从此与上下两行左对齐。
+    return SizedBox(
+      width: double.infinity,
+      child: Row(
+        children: [
+          Container(
+            width: 28,
+            height: 28,
+            decoration: BoxDecoration(
+              color: color.withAlpha(isLight ? 22 : 36),
+              // 图标底板一律走 sm，不跟外层任务卡（lg）同档。
+              borderRadius: BorderRadius.circular(AppRadius.sm),
+            ),
+            child: Icon(icon, size: 16, color: color),
+          ),
+          const SizedBox(width: 9),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  title,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.w700,
+                    color: isLight ? AppColors.slate600 : AppColors.slate300,
+                  ),
+                ),
+                const SizedBox(height: 3),
+                Text(
+                  value,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 12,
+                    height: 1.2,
+                    fontWeight: FontWeight.w600,
+                    fontFamily: isCron ? 'monospace' : null,
+                    color: isLight ? AppColors.slate800 : AppColors.slate100,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          if (cleanExpressions.length > 1) ...[
+            const SizedBox(width: 8),
+            _TaskMiniCountChip(
+              label: '+${cleanExpressions.length - 1}',
+              isLight: isLight,
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _TaskSubscriptionSummary extends StatelessWidget {
+  final List<String> labels;
+  final bool isLight;
+
+  const _TaskSubscriptionSummary({required this.labels, required this.isLight});
+
+  @override
+  Widget build(BuildContext context) {
+    final visibleLabels = labels.take(3).toList();
+
+    // 与上方排期块同一处理：任务卡自身已有 1px 边框，这里原本再套一层
+    // 「白底 + slate200 边」，等于把边框画在同色底上 —— 浅色是白压白、
+    // 深色是 slate900 压 slate900，全靠一条发丝线撑出一个盒子。
+    // 也不能改走 subtle 淡底：里面的订阅标签本身就是 slate50 / slate800 底，
+    // 外层一旦用同一档淡底，标签就会和外层糊成一片，等于把「同色套同色」
+    // 往下挪一层。直接去框，让标签自己完成分组，纵向再省 18dp
+    //（上下各 8dp 内边距 + 2dp 边框），并与排期块左对齐。
+    return SizedBox(
+      width: double.infinity,
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Container(
+            height: 24,
+            padding: const EdgeInsets.symmetric(horizontal: 8),
+            decoration: BoxDecoration(
+              color: AppColors.blue500.withAlpha(isLight ? 18 : 30),
+              borderRadius: BorderRadius.circular(AppRadius.pill),
+            ),
+            child: const Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(Icons.sync_rounded, size: 13, color: AppColors.blue500),
+                SizedBox(width: 4),
+                Text(
+                  '订阅',
+                  style: TextStyle(
+                    fontSize: 10,
+                    fontWeight: FontWeight.w800,
+                    color: AppColors.blue500,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Wrap(
+              spacing: 6,
+              runSpacing: 6,
+              children: [
+                ...visibleLabels.map(
+                  (label) =>
+                      _TaskSubscriptionChip(label: label, isLight: isLight),
+                ),
+                if (labels.length > visibleLabels.length)
+                  _TaskMiniCountChip(
+                    label: '+${labels.length - visibleLabels.length}',
+                    isLight: isLight,
+                  ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _TaskSubscriptionChip extends StatelessWidget {
+  final String label;
+  final bool isLight;
+
+  const _TaskSubscriptionChip({required this.label, required this.isLight});
+
+  @override
+  Widget build(BuildContext context) {
+    // 订阅标签只做轻量展示，不再做成大胶囊，避免任务卡片显得拥挤。
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
+      decoration: BoxDecoration(
+        color: isLight ? AppColors.slate50 : AppColors.slate800,
+        borderRadius: BorderRadius.circular(AppRadius.pill),
+        border: Border.all(
+          color: isLight ? AppColors.slate200 : AppColors.slate700,
+        ),
+      ),
+      child: Text(
+        label,
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+        style: TextStyle(
+          fontSize: 11,
+          fontWeight: FontWeight.w700,
+          color: isLight ? AppColors.slate600 : AppColors.slate300,
+        ),
+      ),
+    );
+  }
+}
+
+class _TaskMiniCountChip extends StatelessWidget {
+  final String label;
+  final bool isLight;
+
+  const _TaskMiniCountChip({required this.label, required this.isLight});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+      decoration: BoxDecoration(
+        color: isLight ? AppColors.slate100 : AppColors.slate800,
+        borderRadius: BorderRadius.circular(AppRadius.pill),
+      ),
+      child: Text(
+        label,
+        style: TextStyle(
+          fontSize: 10,
+          fontWeight: FontWeight.w800,
+          color: isLight ? AppColors.slate500 : AppColors.slate400,
+        ),
+      ),
+    );
+  }
+}
+
+class _MetaChip extends StatelessWidget {
+  final String label;
+  final bool active;
+
+  const _MetaChip({required this.label, this.active = true});
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final isLight = theme.brightness == Brightness.light;
+    final background = active
+        ? (isLight ? AppColors.slate50 : AppColors.slate800)
+        : (isLight ? AppColors.slate100 : AppColors.slate900);
+    final foreground = active
+        ? (isLight ? AppColors.slate700 : AppColors.slate300)
+        : AppColors.slate400;
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      decoration: BoxDecoration(
+        color: background,
+        borderRadius: BorderRadius.circular(AppRadius.pill),
+        border: Border.all(
+          color: isLight ? AppColors.slate200 : AppColors.slate800,
+        ),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            label,
+            style: TextStyle(
+              fontSize: 11,
+              fontWeight: FontWeight.w600,
+              color: foreground,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class TaskLiveLogPage extends ConsumerStatefulWidget {
+  final int taskId;
+  final String? taskName;
+
+  const TaskLiveLogPage({super.key, required this.taskId, this.taskName});
+
+  @override
+  ConsumerState<TaskLiveLogPage> createState() => _TaskLiveLogPageState();
+}
+
+class _TaskLiveLogPageState extends ConsumerState<TaskLiveLogPage> {
+  final _sseClient = SseClient();
+
+  /// 日志正文。增量追加、超长只留最近一部分，渲染与滚动跟随都交给 LogView。
+  final _log = LogLineBuffer();
+
+  /// 服务端重连一律从头重放整段历史（没有 Last-Event-ID），
+  /// 靠它把重放的行抵扣掉，用户才不会看到日志翻倍。
+  final _replayBuffer = SseReplayBuffer();
+
+  /// 正文里现在是不是 SSE 送来的内容，而不是 live-logs 的快照（APP #15）。
+  ///
+  /// live-logs 只回实时日志文件的最后 4KB（首行常常是半截），SSE 却从第一行重放整段历史，
+  /// 快照根本不是重放的前缀。以前把快照交给去重，第一行就对不上，
+  /// 快照和整段历史叠成两份（300 行显示成 354 行）。现在快照只负责先给用户看点东西：
+  /// 第一条 SSE 数据来了就整段换掉；之后（含出错后轮询、再连）只拿 SSE 来的内容去重，
+  /// 不再用快照覆盖它。
+  bool _logFromSse = false;
+
+  /// live-logs 最近一次回的任务状态。轮询放弃时用它判断能不能回落到最近一次日志。
+  double? _liveStatus;
+
+  bool _loading = true;
+  bool _done = false;
+  String _statusText = '连接中...';
+  Timer? _pollTimer;
+  int _pollAttempts = 0;
+  Color? _logBackgroundColor;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadAppearance();
+    Future.microtask(_init);
+  }
+
+  @override
+  void dispose() {
+    _pollTimer?.cancel();
+    _sseClient.close();
+    _log.dispose();
+    super.dispose();
+  }
+
+  Future<void> _init() async {
+    try {
+      final resp = await DioClient.instance.dio.get(
+        ApiEndpoints.taskLiveLogs(widget.taskId),
+      );
+      final data = extractData(resp.data);
+      if (data is Map<String, dynamic>) {
+        _applyLiveSnapshot(data, initial: true);
+        return;
+      }
+    } catch (_) {}
+
+    if (!mounted) return;
+    setState(() {
+      _loading = false;
+      _done = false;
+      _statusText = '等待日志...';
+    });
+    _startPolling();
+  }
+
+  Future<void> _loadAppearance() async {
+    final color = await loadPanelLogBackgroundColor();
+    if (!mounted) {
+      return;
+    }
+    setState(() => _logBackgroundColor = color);
+  }
+
+  void _applyLiveSnapshot(Map<String, dynamic> data, {bool initial = false}) {
+    final rawLogs = data['logs'];
+    final logs = rawLogs is List
+        ? rawLogs
+              .map((item) => item.toString())
+              .where((line) => line.trim().isNotEmpty)
+              .toList()
+        : const <String>[];
+    final done = data['done'] == true;
+    final status = (data['status'] as num?)?.toDouble();
+    final isRunning = !done && status == 2;
+    final shouldKeepPolling = !isRunning && (logs.isEmpty || initial);
+
+    if (!mounted) {
+      return;
+    }
+
+    _liveStatus = status;
+    setState(() {
+      _loading = false;
+      // SSE 已经送来过内容（出错后降级轮询）时不能拿快照覆盖：快照只是最后 4KB，
+      // SSE 来的才是面板重放的前缀，再连上时要靠它去重。
+      if (!_logFromSse) {
+        _log.replaceAll(logs);
+      }
+      _done = done && !shouldKeepPolling;
+      _statusText = shouldKeepPolling
+          ? '等待日志...'
+          : _statusFromLiveTask(status, done: done);
+    });
+
+    if (isRunning) {
+      _pollTimer?.cancel();
+      _connectSSE(widget.taskId);
+      return;
+    }
+
+    if (shouldKeepPolling) {
+      _startPolling();
+      return;
+    }
+
+    _pollTimer?.cancel();
+  }
+
+  void _startPolling() {
+    if (_pollTimer != null) {
+      return;
+    }
+    _pollAttempts = 0;
+    _pollTimer = Timer.periodic(const Duration(seconds: 1), (timer) async {
+      _pollAttempts++;
+      if (!mounted) {
+        _pollTimer?.cancel();
+        _pollTimer = null;
+        return;
+      }
+      try {
+        final resp = await DioClient.instance.dio.get(
+          ApiEndpoints.taskLiveLogs(widget.taskId),
+        );
+        // 这一轮轮询已经停了或换了新的一轮（连上了 SSE、已经放弃、出错后重开）：
+        // 慢过一秒才回来的这一跳作废。否则它会拿空快照盖掉刚回落的正文、再把轮询重新拉起来，
+        // 放弃 → 回落 → 又被盖掉一直循环，每轮都重拉一遍最近一次日志。
+        if (!identical(timer, _pollTimer)) {
+          return;
+        }
+        final data = extractData(resp.data);
+        if (data is Map<String, dynamic>) {
+          _applyLiveSnapshot(data);
+        }
+      } catch (_) {}
+
+      // 只让当前这一轮轮询收口：请求慢过一秒时上一跳的回调可能还没走到这里，
+      // 两跳都放弃的话会把最近一次日志（可能有好几 MB）重复拉两遍。
+      if (_pollAttempts >= 15 &&
+          mounted &&
+          _statusText == '等待日志...' &&
+          identical(timer, _pollTimer)) {
+        _pollTimer?.cancel();
+        _pollTimer = null;
+        // 不再等了。手里只有快照或什么都没有、任务也不在排队时，回落一次最近一次日志：
+        // 面板任务一结束就删掉实时日志，live-logs 之后只会回空的
+        // （从任务列表点「运行」一个几秒就跑完的任务，进来就是这样）。
+        // 还在排队就不回落：那时拿到的是上一次运行的日志，会被当成这一次的结果。
+        if (!_logFromSse && _liveStatus != kTaskStatusQueued) {
+          await _fallbackToLatestLog();
+          if (!mounted) {
+            return;
+          }
+        }
+        setState(() {
+          // 正文与 AppBar 要说同一件事：以前 _done 跟着「有没有日志」走，没日志时
+          // AppBar 已经写着「暂无日志」，正文却还挂着「等待日志输出...」和转圈。
+          _done = true;
+          _statusText = _log.isEmpty ? '暂无日志' : '已完成';
+        });
+      }
+    });
+  }
+
+  /// 回落到这个任务最近一次运行的日志（面板 latest-log，与日志详情页看到的是同一份）。
+  ///
+  /// 只在「运行已经结束、手里只有 live-logs 快照或什么都没有」时用：快照最多 4KB，
+  /// 任务结束后 live-logs 也拿不到内容了。拿不到就保持原样，不报错。
+  Future<void> _fallbackToLatestLog() async {
+    try {
+      final resp = await DioClient.instance.dio.get(
+        ApiEndpoints.taskLatestLog(widget.taskId),
+      );
+      final data = extractData(resp.data);
+      final content = data is Map ? (data['content']?.toString() ?? '') : '';
+      // 等结果的这段时间里 SSE 送来了内容，就以 SSE 的为准。
+      if (!mounted || _logFromSse || content.isEmpty) {
+        return;
+      }
+      final lines = content.replaceAll('\r\n', '\n').split('\n');
+      if (lines.last.isEmpty) {
+        lines.removeLast();
+      }
+      setState(() => _log.replaceAll(lines));
+    } catch (_) {}
+  }
+
+  /// 重连前把已显示的行交给去重缓冲。日志太长时前面的行已经从内存里丢掉，
+  /// 但服务端仍从第一行开始重放，要让它先按行数跳过那一段（同 LogStreamPage）。
+  void _resetReplayBuffer() {
+    if (!_logFromSse) {
+      // 正文还是 live-logs 的快照（或是空的）：它不是重放的前缀，不能拿去去重，
+      // 否则整段历史会接在快照后面（见 _logFromSse）。等第一条数据来了整段换掉。
+      _replayBuffer.clear();
+      return;
+    }
+    _replayBuffer.reset(_log.lines, skipLeading: _log.droppedCount);
+  }
+
+  void _connectSSE(int taskId) {
+    _sseClient.close();
+    _pollTimer?.cancel();
+    _pollTimer = null;
+    _resetReplayBuffer();
+    _sseClient.connect(
+      path: ApiEndpoints.logStream(taskId),
+      autoReconnect: true,
+      // 重放去重统一挂在这里：不管重连是服务端 done:reconnect 触发的，
+      // 还是 token 续期后客户端自己发起的，行为都一样。
+      onReconnect: _resetReplayBuffer,
+      onEvent: (event) {
+        if (!mounted) return;
+        if (event.event == 'done') {
+          if (event.data == 'reconnect') {
+            setState(() {
+              _done = false;
+              _statusText = '运行中';
+            });
+            return;
+          }
+          // finished-late 是面板「等了一会儿才收口」的结束（面板 v3.2.0 起），对这里同样是跑完了。
+          final finished =
+              event.data == 'finished' || event.data == 'finished-late';
+          setState(() {
+            _done = finished;
+            _statusText = _statusFromStreamDone(event.data);
+          });
+          if (finished && !_logFromSse) {
+            // 这条流一行数据都没送来：live-logs 那会儿任务还在跑，连上 SSE 时已经结束了
+            // （短任务很容易碰上）。快照留着别清空（日志不到 4KB 时它就是全量），
+            // 再回落一次最近一次日志拿完整的。
+            _fallbackToLatestLog();
+          }
+          return;
+        }
+        final newLines = event.data.replaceAll('\r\n', '\n').split('\n');
+        newLines.removeWhere((l) => l.isEmpty);
+        if (newLines.isEmpty) return;
+        final wasEmpty = _log.isEmpty;
+        if (_logFromSse) {
+          final dedupedLines = _replayBuffer.consume(newLines);
+          if (dedupedLines.isEmpty) return;
+          _log.append(dedupedLines);
+        } else {
+          // 第一条 SSE 数据：面板从第一行开始重放整段历史，快照整段换掉。
+          _logFromSse = true;
+          _log.replaceAll(newLines);
+        }
+        // 正文由 LogView 监听缓冲区自己刷新，整页只在「从无到有」或状态变了时重建。
+        if (wasEmpty || _done || _statusText != '运行中') {
+          setState(() {
+            _done = false;
+            _statusText = '运行中';
+          });
+        }
+      },
+      onDone: () {
+        if (!mounted) return;
+        if (_done) return;
+        setState(() => _statusText = '连接结束');
+      },
+      onError: (error) {
+        if (!mounted) return;
+        if (error is SseAuthFailure) {
+          // 会话已经死了，轮询接口同样会 401。这里不再降级轮询：
+          // 只会刷一串失败请求，然后被路由踢回登录页，反而盖掉真正的原因。
+          // 文案取短的：_statusText 挂在 AppBar 的 Chip 里，
+          // 整句「登录已失效，请重新登录」会把 actions 撑到溢出，
+          // 完整说明由登录页顶部负责。
+          setState(() => _statusText = '登录已失效');
+          return;
+        }
+        if (!_done) {
+          setState(() => _statusText = '连接错误');
+          _pollTimer?.cancel();
+          _pollTimer = null;
+          _startPolling();
+        }
+      },
+    );
+  }
+
+  String _statusFromLiveTask(double? status, {required bool done}) {
+    if (!done && status == 2) {
+      return '运行中';
+    }
+    if (!done) {
+      return '等待日志...';
+    }
+    switch (status) {
+      case 0:
+        return '已禁用';
+      case 0.5:
+        return '排队中';
+      case 1:
+        return '已启用';
+      case 2:
+        return '已完成';
+      default:
+        return _log.isEmpty ? '等待日志...' : '已完成';
+    }
+  }
+
+  String _statusFromStreamDone(String value) {
+    switch (value) {
+      case 'finished':
+      case 'finished-late':
+        return '已完成';
+      case 'timeout':
+        return '等待日志...';
+      case 'reconnect':
+        return '运行中';
+      default:
+        return value;
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final title = (widget.taskName?.trim().isNotEmpty ?? false)
+        ? '${widget.taskName} 运行日志'
+        : '运行日志';
+    final logTheme = resolveLogSurfaceTheme(
+      _logBackgroundColor,
+      themeBrightness: Theme.of(context).brightness,
+    );
+    final chipBackground = logTheme.brightness == Brightness.dark
+        ? AppColors.slate800
+        : AppColors.slate100;
+
+    return Scaffold(
+      backgroundColor: logTheme.background,
+      appBar: AppBar(
+        title: Text(title),
+        backgroundColor: logTheme.background,
+        foregroundColor: logTheme.foreground,
+        actions: [
+          Padding(
+            padding: const EdgeInsets.only(right: 4),
+            child: Chip(
+              backgroundColor: chipBackground,
+              label: Text(
+                _statusText,
+                style: TextStyle(fontSize: 11, color: logTheme.foreground),
+              ),
+              avatar: _done
+                  ? Icon(Icons.check, size: 14, color: logTheme.foreground)
+                  : SizedBox(
+                      width: 12,
+                      height: 12,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        color: logTheme.foreground,
+                      ),
+                    ),
+              visualDensity: VisualDensity.compact,
+            ),
+          ),
+          if (_log.isNotEmpty)
+            IconButton(
+              icon: Icon(Icons.copy, color: logTheme.foreground),
+              tooltip: '复制全部',
+              onPressed: () {
+                Clipboard.setData(ClipboardData(text: _log.joinAll()));
+                // 特意保留 2s（默认 4s）：这里是日志页，提示条浮在正文上方，
+                // 而复制成功是即时可感知的，没必要占着屏幕挡住刚复制的那几行。
+                // success 快捷方法不转发 duration，所以走 show(tone:)。
+                AppSnack.show(
+                  context,
+                  // 截断后内存里只有最近一部分，得说清楚复制到的不是全部。
+                  _log.droppedCount > 0
+                      ? '已复制最近 ${_log.length} 行'
+                      : '日志已复制到剪贴板',
+                  tone: AppSnackTone.success,
+                  duration: const Duration(seconds: 2),
+                );
+              },
+            ),
+          // 原来这里还有一个「自动滚动」开关，已经去掉：停在底部就跟随、
+          // 上翻就停，回到底部由正文右下角的按钮负责（issue #10）。
+        ],
+      ),
+      body: Container(
+        color: logTheme.background,
+        child: _loading && _log.isEmpty
+            ? const Center(
+                child: CircularProgressIndicator(color: AppColors.primary),
+              )
+            : _log.isEmpty
+            ? Center(
+                child: Text(
+                  _done ? '无日志内容' : '等待日志输出...',
+                  style: TextStyle(color: logTheme.mutedForeground),
+                ),
+              )
+            : LogView(
+                buffer: _log,
+                textStyle: TextStyle(
+                  color: logTheme.foreground,
+                  fontFamily: 'monospace',
+                  fontSize: 12,
+                  height: 1.6,
+                ),
+                brightness: logTheme.brightness,
+                mutedColor: logTheme.mutedForeground,
+                // 这个页面只知道任务、不知道日志记录 id，下载入口在日志详情页。
+                truncatedHint: '完整日志可在「运行日志」里打开这条记录下载',
+              ),
+      ),
+    );
+  }
+}
+
+String _extractTaskError(dynamic error, String fallback) =>
+    extractErrorMessage(error, fallback);
+
+class _GroupPopupMenu extends StatelessWidget {
+  final bool isUngrouped;
+  final VoidCallback? onRename;
+  final VoidCallback? onDelete;
+  final VoidCallback onAddTasks;
+
+  const _GroupPopupMenu({
+    required this.isUngrouped,
+    this.onRename,
+    this.onDelete,
+    required this.onAddTasks,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return PopupMenuButton<String>(
+      icon: Icon(Icons.more_vert, size: 18, color: AppColors.slate400),
+      padding: EdgeInsets.zero,
+      // 这里原本是 `const BoxConstraints()` —— 空约束会把 IconButton 默认的
+      // 48×48 直接取消掉，实际命中区退化成那个 18dp 图标，是全库最小的几处之一。
+      // 不能简单删掉这行：删了会回到 48 并把分组头撑高。
+      constraints: const BoxConstraints(
+        minWidth: AppTapTarget.min,
+        minHeight: AppTapTarget.min,
+      ),
+      itemBuilder: (ctx) => [
+        if (!isUngrouped && onRename != null)
+          const PopupMenuItem(value: 'rename', child: Text('重命名分组')),
+        if (!isUngrouped && onDelete != null)
+          const PopupMenuItem(value: 'delete', child: Text('删除分组')),
+        PopupMenuItem(value: 'add', child: Text(isUngrouped ? '新建分组' : '添加任务')),
+      ],
+      onSelected: (value) {
+        switch (value) {
+          case 'rename':
+            onRename?.call();
+          case 'delete':
+            onDelete?.call();
+          case 'add':
+            onAddTasks();
+        }
+      },
+    );
+  }
+}
