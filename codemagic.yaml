@@ -42,6 +42,8 @@ workflows:
           cp -R "$APP_PATH" build/ios/ipa/Payload/Runner.app
           cd build/ios/ipa
           zip -qry Runner-unsigned.ipa Payload
-          ls -lh Runner-unsigned.ipa
+          # iOS 的 Safari 对 .ipa 会跳 App Store，再包一层 zip 才能正常存进「文件」
+          zip -qry Runner-unsigned-ipa.zip Runner-unsigned.ipa
+          ls -lh Runner-unsigned.ipa Runner-unsigned-ipa.zip
     artifacts:
-      - build/ios/ipa/Runner-unsigned.ipa
+      - build/ios/ipa/Runner-unsigned-ipa.zip
