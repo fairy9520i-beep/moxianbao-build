@@ -409,7 +409,15 @@ class _AppBootPageState extends ConsumerState<AppBootPage> {
     return Column(
       mainAxisAlignment: MainAxisAlignment.center,
       children: [
-        Image.asset('assets/icon.png', width: 72, height: 72),
+        ClipRRect(
+          borderRadius: BorderRadius.circular(AppRadius.lg),
+          child: Image.asset(
+            'assets/background.jpg',
+            width: 72,
+            height: 72,
+            fit: BoxFit.cover,
+          ),
+        ),
         const SizedBox(height: 20),
         const SizedBox(
           width: 28,

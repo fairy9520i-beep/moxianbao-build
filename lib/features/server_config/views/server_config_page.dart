@@ -379,7 +379,12 @@ class _ServerConfigPageState extends ConsumerState<ServerConfigPage> {
               ClipRRect(
                 // 64 的主视觉 logo，直接摆在页面上、内部不再套层，走 lg。
                 borderRadius: BorderRadius.circular(AppRadius.lg),
-                child: Image.asset('assets/icon.png', width: 64, height: 64),
+                child: Image.asset(
+                  'assets/background.jpg',
+                  width: 64,
+                  height: 64,
+                  fit: BoxFit.cover,
+                ),
               ),
               const SizedBox(height: 12),
               Text(
