@@ -287,7 +287,7 @@ class _LoginPageState extends ConsumerState<LoginPage> {
                                 ),
                                 child: Image.asset(
                                   'assets/background.jpg',
-                                  width: 44,
+                                  width: 64,
                                   height: 44,
                                   fit: BoxFit.cover,
                                 ),
@@ -323,13 +323,16 @@ class _LoginPageState extends ConsumerState<LoginPage> {
                               ),
                             )
                           else
-                            const Text(
-                              '有个女王不得了',
-                              style: TextStyle(
-                                fontFamily: 'MoxianMagic',
-                                fontSize: 19,
-                                letterSpacing: 2,
-                                color: AppColors.onGlassStrong,
+                            const Padding(
+                              padding: EdgeInsets.only(left: 26, top: 6),
+                              child: Text(
+                                '有个女王不得了',
+                                style: TextStyle(
+                                  fontFamily: 'MoxianMagic',
+                                  fontSize: 19,
+                                  letterSpacing: 2,
+                                  color: AppColors.onGlassStrong,
+                                ),
                               ),
                             ),
                           const SizedBox(height: 26),
@@ -394,7 +397,8 @@ class _LoginPageState extends ConsumerState<LoginPage> {
                                   color: AppColors.onGlassDim,
                                   fontSize: 14,
                                 ),
-                                border: InputBorder.none,
+                                filled: false,
+                                      border: InputBorder.none,
                                 enabledBorder: InputBorder.none,
                                 focusedBorder: InputBorder.none,
                                 contentPadding: EdgeInsets.zero,
@@ -440,7 +444,8 @@ class _LoginPageState extends ConsumerState<LoginPage> {
                                   color: AppColors.onGlassDim,
                                   fontSize: 14,
                                 ),
-                                border: InputBorder.none,
+                                filled: false,
+                                      border: InputBorder.none,
                                 enabledBorder: InputBorder.none,
                                 focusedBorder: InputBorder.none,
                                 contentPadding: EdgeInsets.zero,
@@ -490,7 +495,8 @@ class _LoginPageState extends ConsumerState<LoginPage> {
                                     color: AppColors.onGlassDim,
                                     fontSize: 14,
                                   ),
-                                  border: InputBorder.none,
+                                  filled: false,
+                                      border: InputBorder.none,
                                   enabledBorder: InputBorder.none,
                                   focusedBorder: InputBorder.none,
                                   contentPadding: EdgeInsets.zero,
@@ -685,6 +691,8 @@ class _IconInput extends StatelessWidget {
     return Container(
       height: 52,
       padding: const EdgeInsets.symmetric(horizontal: 14),
+      // 裁掉子级 TextField 的直角填充，否则白底方角会盖住圆角玻璃。
+      clipBehavior: Clip.antiAlias,
       decoration: BoxDecoration(
         // 登录页固定深色玻璃，输入框不再跟随明暗主题取 white / slate900。
         color: AppColors.glassFill,
