@@ -15,13 +15,33 @@ workflows:
       - name: Resolve packages
         script: |
           flutter pub get
-      - name: Build unsigned IPA
+          flutter build ios --release --config-only --no-codesign
+      - name: Archive without signing
         script: |
-          flutter build ios --release --no-codesign
-          cd build/ios/iphoneos
-          mkdir -p Payload
-          cp -R Runner.app Payload/
+          set -e
+          xcodebuild \
+            -workspace ios/Runner.xcworkspace \
+            -scheme Runner \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination generic/platform=iOS \
+            -archivePath "$PWD/build/ios/archive/Runner.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            archive
+      - name: Package IPA
+        script: |
+          set -e
+          APP_PATH="$PWD/build/ios/archive/Runner.xcarchive/Products/Applications/Runner.app"
+          test -d "$APP_PATH"
+          rm -rf build/ios/ipa
+          mkdir -p build/ios/ipa/Payload
+          cp -R "$APP_PATH" build/ios/ipa/Payload/Runner.app
+          cd build/ios/ipa
           zip -qry Runner-unsigned.ipa Payload
           ls -lh Runner-unsigned.ipa
     artifacts:
-      - build/ios/iphoneos/Runner-unsigned.ipa
+      - build/ios/ipa/Runner-unsigned.ipa
