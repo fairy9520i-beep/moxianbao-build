@@ -549,6 +549,15 @@ class _EnvListPageState extends ConsumerState<EnvListPage> {
   /// 拖拽途中列表被重拉成另一种顺序时，松手给的下标就对不上了，靠它核对（APP #16 ① 的 G5）。
   int? _draggingEnvId;
 
+  /// 变量 id → 自动归属的任务名（变量名出现在该任务的脚本里）。
+  Map<int, String> _autoTaskOf = const <int, String>{};
+
+  /// 变量 id → 引用它的任务 id 集合。
+  Map<int, Set<int>> _refTaskIds = const <int, Set<int>>{};
+
+  /// 已展开的分组名；不在集合里就是折叠（默认全折叠）。
+  final Set<String> _expandedGroups = <String>{};
+
   Widget _buildGroupAutocomplete({
     required TextEditingController controller,
     required List<String> options,
@@ -637,7 +646,10 @@ class _EnvListPageState extends ConsumerState<EnvListPage> {
   @override
   void initState() {
     super.initState();
-    Future.microtask(() => ref.read(envListProvider.notifier).load());
+    Future.microtask(() async {
+      await ref.read(envListProvider.notifier).load();
+      if (mounted) await _loadEnvTaskLinks();
+    });
   }
 
   @override
@@ -645,6 +657,125 @@ class _EnvListPageState extends ConsumerState<EnvListPage> {
     _debounce?.cancel();
     _searchController.dispose();
     super.dispose();
+  }
+
+  /// 按「手动分组 > 自动归属 > 未分组」把变量分组。
+  List<_EnvGroupData> _groupEnvs(List<EnvVar> envs) {
+    final order = <String>[];
+    final buckets = <String, List<EnvVar>>{};
+    final autoFlags = <String, bool>{};
+
+    for (final env in envs) {
+      final manual = env.groups.isNotEmpty ? env.groups.first : '';
+      final autoName = _autoTaskOf[env.id] ?? '';
+      final name = manual.isNotEmpty
+          ? manual
+          : (autoName.isNotEmpty ? autoName : '未分组');
+      final isAuto = manual.isEmpty && autoName.isNotEmpty;
+
+      if (!buckets.containsKey(name)) {
+        buckets[name] = <EnvVar>[];
+        order.add(name);
+        autoFlags[name] = isAuto;
+      }
+      buckets[name]!.add(env);
+    }
+
+    return [
+      for (final name in order)
+        _EnvGroupData(
+          name: name,
+          envs: buckets[name]!,
+          auto: autoFlags[name] ?? false,
+        ),
+    ];
+  }
+
+  /// 这一组里的变量一共被多少个任务引用（任务 id 去重）。
+  int _refTaskCount(List<EnvVar> envs) {
+    final ids = <int>{};
+    for (final env in envs) {
+      ids.addAll(_refTaskIds[env.id] ?? const <int>{});
+    }
+    return ids.length;
+  }
+
+  /// 自动归属：读任务列表和脚本内容，变量名出现在脚本里就算被该任务引用。
+  /// 只读接口，失败就当没有自动归属，不影响变量列表本身。
+  Future<void> _loadEnvTaskLinks() async {
+    try {
+      final dio = _dio;
+      final response = await dio.get(
+        ApiEndpoints.tasks,
+        queryParameters: const {'all': 1},
+      );
+      final tasks = extractPaginated(response.data).items;
+      final envs = ref.read(envListProvider).envs;
+      if (envs.isEmpty) return;
+
+      final auto = <int, String>{};
+      final refs = <int, Set<int>>{};
+      final filePattern = RegExp(
+        r'([A-Za-z0-9_.-]+\.(?:py|js|ts|sh|bash))',
+      );
+
+      for (final task in tasks) {
+        final taskId = task['id'] is num ? (task['id'] as num).toInt() : 0;
+        final taskName = task['name']?.toString() ?? '';
+        final bound =
+            (task['env_names'] as List?)
+                ?.map((e) => e.toString())
+                .toSet() ??
+            const <String>{};
+        final command = task['command']?.toString() ?? '';
+
+        for (final env in envs) {
+          if (bound.contains(env.name)) {
+            (refs[env.id] ??= <int>{}).add(taskId);
+            auto.putIfAbsent(env.id, () => taskName);
+          }
+        }
+
+        final match = filePattern.firstMatch(command);
+        if (match == null) continue;
+        var content = '';
+        try {
+          final script = await dio.get(
+            ApiEndpoints.scriptsContent,
+            queryParameters: {'path': match.group(1)!},
+          );
+          content = _scriptText(script.data);
+        } catch (_) {
+          continue;
+        }
+        if (content.isEmpty) continue;
+
+        final lower = content.toLowerCase();
+        for (final env in envs) {
+          if (!lower.contains(env.name.toLowerCase())) continue;
+          (refs[env.id] ??= <int>{}).add(taskId);
+          auto.putIfAbsent(env.id, () => taskName);
+        }
+      }
+
+      if (!mounted) return;
+      setState(() {
+        _autoTaskOf = auto;
+        _refTaskIds = refs;
+      });
+    } catch (_) {
+      // 自动归属只是锦上添花，失败时保持原有的手动分组。
+    }
+  }
+
+  /// 面板的脚本内容接口返回 {"data":{"content":"..."}}。
+  String _scriptText(dynamic payload) {
+    dynamic data = payload;
+    if (data is Map && data['data'] is Map) data = data['data'];
+    if (data is Map && data['content'] is String) {
+      return data['content'] as String;
+    }
+    return '';
   }
 
   bool _isSelected(int id) => _selectedIds.contains(id);
@@ -1075,6 +1206,7 @@ class _EnvListPageState extends ConsumerState<EnvListPage> {
       _setSelectionMode(false);
     }
     await ref.read(envListProvider.notifier).load();
+    if (mounted) await _loadEnvTaskLinks();
   }
 
   /// 导入 / 导出入口。
@@ -1692,12 +1824,9 @@ class _EnvListPageState extends ConsumerState<EnvListPage> {
                           );
                         },
                       )
-                    : ListView.builder(
-                        padding: const EdgeInsets.fromLTRB(20, 0, 20, 100),
-                        itemCount: state.envs.length,
-                        itemBuilder: (_, i) {
-                          final env = state.envs[i];
-                          return _EnvCard(
+                    : Builder(
+                        builder: (context) {
+                          Widget cardOf(EnvVar env) => _EnvCard(
                             env: env,
                             isLight: isLight,
                             selectionMode: _selectionMode,
@@ -1723,6 +1852,42 @@ class _EnvListPageState extends ConsumerState<EnvListPage> {
                             onEnable: () => _setEnvEnabled(env, true),
                             onDisable: () => _setEnvEnabled(env, false),
                             onDelete: () => _deleteEnv(env),
+                          );
+
+                          final groups = _groupEnvs(state.envs);
+                          return ListView.builder(
+                            padding: const EdgeInsets.fromLTRB(20, 0, 20, 100),
+                            itemCount: groups.length,
+                            itemBuilder: (_, i) {
+                              final group = groups[i];
+                              final expanded = _expandedGroups.contains(
+                                group.name,
+                              );
+                              return Column(
+                                key: ValueKey('env-group-${group.name}'),
+                                crossAxisAlignment: CrossAxisAlignment.stretch,
+                                children: [
+                                  _EnvGroupHeader(
+                                    name: group.name,
+                                    count: group.envs.length,
+                                    enabledCount: group.envs
+                                        .where((e) => e.enabled)
+                                        .length,
+                                    refCount: _refTaskCount(group.envs),
+                                    auto: group.auto,
+                                    expanded: expanded,
+                                    onTap: () => setState(() {
+                                      if (expanded) {
+                                        _expandedGroups.remove(group.name);
+                                      } else {
+                                        _expandedGroups.add(group.name);
+                                      }
+                                    }),
+                                  ),
+                                  if (expanded) ...group.envs.map(cardOf),
+                                ],
+                              );
+                            },
                           );
                         },
                       ),
@@ -3626,6 +3791,120 @@ class _MiniBtn extends StatelessWidget {
           borderRadius: BorderRadius.circular(AppRadius.sm),
         ),
         child: Icon(icon, size: 14, color: AppColors.slate400),
+      ),
+    );
+  }
+}
+
+class _EnvGroupData {
+  final String name;
+  final List<EnvVar> envs;
+  final bool auto;
+
+  const _EnvGroupData({
+    required this.name,
+    required this.envs,
+    this.auto = false,
+  });
+}
+
+class _EnvGroupHeader extends StatelessWidget {
+  final String name;
+  final int count;
+  final int enabledCount;
+  final int refCount;
+  final bool auto;
+  final bool expanded;
+  final VoidCallback onTap;
+
+  const _EnvGroupHeader({
+    required this.name,
+    required this.count,
+    required this.enabledCount,
+    required this.refCount,
+    required this.auto,
+    required this.expanded,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final surfaces = AppSurfaces.of(context);
+    final radius = BorderRadius.circular(AppRadius.md);
+
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: Material(
+        color: surfaces.card,
+        borderRadius: radius,
+        child: InkWell(
+          onTap: onTap,
+          borderRadius: radius,
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+            decoration: BoxDecoration(
+              borderRadius: radius,
+              border: Border.all(color: surfaces.cardBorder),
+            ),
+            child: Row(
+              children: [
+                Expanded(
+                  child: Row(
+                    children: [
+                      Flexible(
+                        child: Text(
+                          name,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: 14,
+                            fontWeight: FontWeight.w700,
+                            color: surfaces.strongText,
+                          ),
+                        ),
+                      ),
+                      if (auto) ...[
+                        const SizedBox(width: 6),
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 6,
+                            vertical: 2,
+                          ),
+                          decoration: BoxDecoration(
+                            color: surfaces.tintBg(AppColors.primary),
+                            borderRadius: BorderRadius.circular(AppRadius.sm),
+                          ),
+                          child: Text(
+                            '自动',
+                            style: TextStyle(
+                              fontSize: 10,
+                              color: surfaces.tintFg(AppColors.primary),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Text(
+                  '$count 个 · $enabledCount 启用 · $refCount 引用',
+                  style: TextStyle(fontSize: 11, color: surfaces.mutedText),
+                ),
+                const SizedBox(width: 2),
+                AnimatedRotation(
+                  turns: expanded ? 0.25 : 0,
+                  duration: const Duration(milliseconds: 180),
+                  child: Icon(
+                    Icons.chevron_right,
+                    size: 18,
+                    color: surfaces.mutedText,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
       ),
     );
   }
