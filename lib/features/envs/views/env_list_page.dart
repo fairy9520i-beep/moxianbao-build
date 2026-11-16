@@ -704,7 +704,7 @@ class _EnvListPageState extends ConsumerState<EnvListPage> {
   /// 只读接口，失败就当没有自动归属，不影响变量列表本身。
   Future<void> _loadEnvTaskLinks() async {
     try {
-      final dio = _dio;
+      final dio = DioClient.instance.dio;
       final response = await dio.get(
         ApiEndpoints.tasks,
         queryParameters: const {'all': 1},

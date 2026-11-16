@@ -424,7 +424,7 @@ class _LoginPageState extends ConsumerState<LoginPage> {
                                     ? Icons.visibility_off_outlined
                                     : Icons.visibility_outlined,
                                 size: 20,
-                                color: const AppColors.onGlassMuted,
+                                color: AppColors.onGlassMuted,
                               ),
                             ),
                             child: TextFormField(
@@ -687,13 +687,13 @@ class _IconInput extends StatelessWidget {
       padding: const EdgeInsets.symmetric(horizontal: 14),
       decoration: BoxDecoration(
         // 登录页固定深色玻璃，输入框不再跟随明暗主题取 white / slate900。
-        color: const AppColors.glassFill,
+        color: AppColors.glassFill,
         borderRadius: BorderRadius.circular(AppRadius.lg),
-        border: Border.all(color: const AppColors.fieldBorder),
+        border: Border.all(color: AppColors.fieldBorder),
       ),
       child: Row(
         children: [
-          Icon(icon, size: 20, color: const AppColors.onGlassMuted),
+          Icon(icon, size: 20, color: AppColors.onGlassMuted),
           const SizedBox(width: 12),
           Expanded(child: child),
           if (suffix != null) ...[const SizedBox(width: 8), suffix!],
@@ -718,7 +718,7 @@ class _CompactCheck extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final color = enabled ? const AppColors.onGlassCheck : const AppColors.onGlassDisabled;
+    final color = enabled ? AppColors.onGlassCheck : AppColors.onGlassDisabled;
 
     return GestureDetector(
       onTap: enabled ? () => onChanged(!value) : null,
@@ -760,9 +760,9 @@ class _GlassCard extends StatelessWidget {
         child: Container(
           padding: const EdgeInsets.fromLTRB(22, 24, 22, 20),
           decoration: BoxDecoration(
-            color: const AppColors.glassFill,
+            color: AppColors.glassFill,
             borderRadius: BorderRadius.circular(AppRadius.lg),
-            border: Border.all(color: const AppColors.glassBorder, width: 1),
+            border: Border.all(color: AppColors.glassBorder, width: 1),
           ),
           child: child,
         ),
