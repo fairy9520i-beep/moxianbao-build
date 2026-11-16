@@ -286,7 +286,7 @@ class _LoginPageState extends ConsumerState<LoginPage> {
                                   AppRadius.lg,
                                 ),
                                 child: Image.asset(
-                                  'assets/icon.png',
+                                  'assets/background.jpg',
                                   width: 44,
                                   height: 44,
                                   fit: BoxFit.cover,
