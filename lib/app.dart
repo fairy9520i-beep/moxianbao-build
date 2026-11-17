@@ -25,21 +25,29 @@ class DaidaiApp extends ConsumerWidget {
     final appearance = ref.watch(appAppearanceProvider);
     // AppSurfaces 是无状态的取色器，把可变透明度挂上去，全库卡片一起生效。
     AppSurfaces.cardAlpha = appearance.cardOpacity;
+    AppSurfaces.cardRadius = appearance.cardRadius;
+    AppSurfaces.borderAlpha = appearance.borderOpacity;
 
     return MaterialApp.router(
       title: '魔仙堡',
       debugShowCheckedModeBanner: false,
       theme: AppTheme.light(),
       darkTheme: AppTheme.dark(),
-      themeMode: ThemeMode.system,
+      themeMode: appearance.themeMode,
       routerConfig: router,
       locale: const Locale('zh', 'CN'),
       // 不挂这三个 delegate，长按输入框的复制/粘贴/全选菜单会是英文（APP #17）。
       localizationsDelegates: appLocalizationsDelegates,
       supportedLocales: appSupportedLocales,
-      builder: (context, child) => AppLockGate(
-        child: AppBackground(child: child ?? const SizedBox.shrink()),
-      ),
+      builder: (context, child) {
+        final scaled = MediaQuery(
+          data: MediaQuery.of(context).copyWith(
+            textScaler: TextScaler.linear(appearance.fontScale),
+          ),
+          child: child ?? const SizedBox.shrink(),
+        );
+        return AppLockGate(child: AppBackground(child: scaled));
+      },
     );
   }
 }
