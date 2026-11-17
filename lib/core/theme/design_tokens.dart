@@ -174,12 +174,19 @@ class AppSurfaces {
   /// 卡片底色不透明度，由「App 外观工坊」在运行时写入（1 = 完全不透明）。
   static double cardAlpha = 1.0;
 
+  /// 全局卡片圆角，由「App 外观工坊」写入。
+  static double cardRadius = 14;
+
+  /// 卡片描边透明度，由「App 外观工坊」写入。
+  static double borderAlpha = 1.0;
+
   /// 卡片底色。原写法：`isLight ? Colors.white : AppColors.slate900`。
   Color get card => (isLight ? Colors.white : AppColors.slate900)
       .withAlpha((cardAlpha * 255).round().clamp(0, 255));
 
   /// 卡片描边。原写法：`isLight ? AppColors.slate200 : AppColors.slate800`。
-  Color get cardBorder => isLight ? AppColors.slate200 : AppColors.slate800;
+  Color get cardBorder => (isLight ? AppColors.slate200 : AppColors.slate800)
+      .withAlpha((borderAlpha * 255).round().clamp(0, 255));
 
   /// 卡片内嵌的次级浅底块。原写法：`isLight ? AppColors.slate50 : AppColors.slate800`。
   Color get subtle => isLight ? AppColors.slate50 : AppColors.slate800;
