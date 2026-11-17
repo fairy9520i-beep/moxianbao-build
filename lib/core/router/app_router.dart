@@ -5,7 +5,7 @@ import '../auth/auth_provider.dart';
 import 'default_landing_page.dart';
 import '../../features/login/views/app_boot_page.dart';
 import '../../features/login/views/login_web_page.dart';
-import '../../features/settings/views/neo_workshop_page.dart';
+import '../../features/settings/views/app_workshop_page.dart';
 import '../../features/server_config/views/server_config_page.dart';
 import '../../features/dashboard/views/dashboard_page.dart';
 import '../../features/tasks/views/task_list_page.dart';
@@ -285,7 +285,7 @@ final routerProvider = Provider<GoRouter>((ref) {
       GoRoute(
         path: '/neo-workshop',
         parentNavigatorKey: _rootNavigatorKey,
-        builder: (_, state) => const NeoWorkshopPage(),
+        builder: (_, state) => const AppWorkshopPage(),
       ),
       GoRoute(
         path: '/about',
