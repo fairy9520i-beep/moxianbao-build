@@ -36,10 +36,11 @@ class AppAppearance {
     this.cardOpacity = 1,
     this.cardRadius = 14,
     this.borderOpacity = 1,
-    this.navOpacity = 0.9,
-    this.navBlur = 20,
-    this.navRadius = 0,
-    this.navFloating = false,
+    // 默认就是 QQ 那种悬浮玻璃 Dock，装上即见，不用先去翻开关。
+    this.navOpacity = 0.78,
+    this.navBlur = 25,
+    this.navRadius = 22,
+    this.navFloating = true,
     this.fontScale = 1,
     this.themeChoice = AppThemeChoice.system,
   });
@@ -131,7 +132,7 @@ class AppAppearanceNotifier extends StateNotifier<AppAppearance> {
     _load();
   }
 
-  static const _key = 'app_appearance_v2';
+  static const _key = 'app_appearance_v3';
 
   Future<void> _load() async {
     try {
