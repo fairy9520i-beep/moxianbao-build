@@ -5,6 +5,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import '../../core/auth/auth_provider.dart';
 import '../../core/services/app_update_service.dart';
+import '../../core/appearance/app_appearance.dart';
 import '../../core/theme/app_theme.dart';
 import '../../core/theme/design_tokens.dart';
 import 'app_snack.dart';
@@ -90,6 +91,7 @@ class _MainScaffoldState extends ConsumerState<MainScaffold> {
     });
     final theme = Theme.of(context);
     final isLight = theme.brightness == Brightness.light;
+    final appearance = ref.watch(appAppearanceProvider);
     final idx = _currentIndex(context);
 
     return PopScope<void>(
@@ -99,13 +101,17 @@ class _MainScaffoldState extends ConsumerState<MainScaffold> {
         body: widget.child,
         extendBody: true,
         bottomNavigationBar: ClipRRect(
+          borderRadius: BorderRadius.circular(appearance.navRadius),
           child: BackdropFilter(
-            filter: ImageFilter.blur(sigmaX: 20, sigmaY: 20),
+            filter: ImageFilter.blur(
+              sigmaX: appearance.navBlur,
+              sigmaY: appearance.navBlur,
+            ),
             child: Container(
               decoration: BoxDecoration(
-                color: isLight
-                    ? Colors.white.withAlpha(230)
-                    : AppColors.slate900.withAlpha(230),
+                color: (isLight ? Colors.white : AppColors.slate900).withAlpha(
+                  (appearance.navOpacity * 255).round().clamp(0, 255),
+                ),
                 border: Border(
                   top: BorderSide(
                     color: isLight ? AppColors.slate200 : AppColors.slate800,
