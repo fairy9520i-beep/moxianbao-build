@@ -42,8 +42,8 @@ class AppCard extends StatelessWidget {
   /// 外边距。默认无。
   final EdgeInsetsGeometry? margin;
 
-  /// 圆角。默认 [AppRadius.lg]（14），与既有列表项/区块卡片一致。
-  final double radius;
+  /// 圆角。为空时跟 App 外观工坊里的全局卡片圆角走。
+  final double? radius;
 
   /// 覆盖底色。默认走 [AppSurfaces.card]。
   final Color? color;
@@ -63,7 +63,7 @@ class AppCard extends StatelessWidget {
     required this.child,
     this.padding = const EdgeInsets.all(AppSpacing.lg),
     this.margin,
-    this.radius = AppRadius.lg,
+    this.radius,
     this.color,
     this.borderColor,
     this.bordered = true,
@@ -75,7 +75,7 @@ class AppCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final surfaces = AppSurfaces.of(context);
-    final borderRadius = BorderRadius.circular(radius);
+    final borderRadius = BorderRadius.circular(radius ?? AppSurfaces.cardRadius);
     final decoration = BoxDecoration(
       color: color ?? surfaces.card,
       borderRadius: borderRadius,
