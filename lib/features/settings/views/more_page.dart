@@ -335,12 +335,6 @@ class _MorePageState extends ConsumerState<MorePage> {
           const AppSectionTitle('其他', padding: EdgeInsets.only(left: 2)),
           const SizedBox(height: 8),
           _SettingsItem(
-            icon: Icons.volunteer_activism_outlined,
-            title: '赞助名单',
-            isLight: isLight,
-            onTap: () => context.push('/sponsors'),
-          ),
-          _SettingsItem(
             icon: Icons.system_update_outlined,
             title: '检查更新',
             isLight: isLight,
