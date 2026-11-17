@@ -5,6 +5,7 @@ import '../auth/auth_provider.dart';
 import 'default_landing_page.dart';
 import '../../features/login/views/app_boot_page.dart';
 import '../../features/login/views/login_web_page.dart';
+import '../../features/settings/views/neo_workshop_page.dart';
 import '../../features/server_config/views/server_config_page.dart';
 import '../../features/dashboard/views/dashboard_page.dart';
 import '../../features/tasks/views/task_list_page.dart';
@@ -281,6 +282,11 @@ final routerProvider = Provider<GoRouter>((ref) {
       ),
       // 关于页（issue #12 / v1.3.7）。受上面 83 行的登录门禁约束，只有登录后能进；
       // 入口就在设置页，所以没影响——以后若想在登录页放「关于」，得先改那行判断。
+      GoRoute(
+        path: '/neo-workshop',
+        parentNavigatorKey: _rootNavigatorKey,
+        builder: (_, state) => const NeoWorkshopPage(),
+      ),
       GoRoute(
         path: '/about',
         parentNavigatorKey: _rootNavigatorKey,
