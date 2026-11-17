@@ -4,7 +4,7 @@ import 'package:go_router/go_router.dart';
 import '../auth/auth_provider.dart';
 import 'default_landing_page.dart';
 import '../../features/login/views/app_boot_page.dart';
-import '../../features/login/views/login_page.dart';
+import '../../features/login/views/login_web_page.dart';
 import '../../features/server_config/views/server_config_page.dart';
 import '../../features/dashboard/views/dashboard_page.dart';
 import '../../features/tasks/views/task_list_page.dart';
@@ -97,7 +97,7 @@ final routerProvider = Provider<GoRouter>((ref) {
           manageMode: state.uri.queryParameters['manage'] == '1',
         ),
       ),
-      GoRoute(path: '/login', builder: (_, state) => const LoginPage()),
+      GoRoute(path: '/login', builder: (_, state) => const LoginWebPage()),
       ShellRoute(
         navigatorKey: _shellNavigatorKey,
         builder: (_, state, child) => MainScaffold(child: child),
