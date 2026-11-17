@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
@@ -21,6 +23,10 @@ class MorePage extends ConsumerStatefulWidget {
 }
 
 class _MorePageState extends ConsumerState<MorePage> {
+
+  int _aboutTaps = 0;
+  DateTime? _lastAboutTap;
+  bool _showWorkshopEntry = false;
   AppUpdateInfo? _updateInfo;
   bool _checking = false;
   String? _serverUrl;
@@ -136,6 +142,36 @@ class _MorePageState extends ConsumerState<MorePage> {
     if (selected == null) return;
     await DefaultLandingPage.save(selected);
     if (mounted) setState(() {});
+  }
+
+  /// 关于入口的彩蛋：连点三下显示外观工坊，连点四下隐藏；
+  /// 单击要等 0.9 秒确认不是连击，再进关于页。
+  void _onAboutTap() {
+    final now = DateTime.now();
+    if (_lastAboutTap != null &&
+        now.difference(_lastAboutTap!) > const Duration(milliseconds: 900)) {
+      _aboutTaps = 0;
+    }
+    _lastAboutTap = now;
+    _aboutTaps += 1;
+
+    if (_aboutTaps >= 4) {
+      setState(() => _showWorkshopEntry = false);
+      _aboutTaps = 0;
+      return;
+    }
+    if (_aboutTaps == 3) {
+      setState(() => _showWorkshopEntry = true);
+      return;
+    }
+
+    Future.delayed(const Duration(milliseconds: 950), () {
+      if (!mounted) return;
+      if (_aboutTaps == 1 || _aboutTaps == 2) {
+        _aboutTaps = 0;
+        context.push('/about');
+      }
+    });
   }
 
   @override
@@ -386,10 +422,15 @@ class _MorePageState extends ConsumerState<MorePage> {
             icon: Icons.info_outline,
             title: '关于',
             isLight: isLight,
-            // 原先是本页的 _showAboutDialog 弹窗，issue #12 要补作者/项目/反馈三组
-            // 外链，弹窗装不下，已改成独立页（issue #12 / v1.3.7）
-            onTap: () => context.push('/about'),
+            onTap: _onAboutTap,
           ),
+          if (_showWorkshopEntry)
+            _SettingsItem(
+              icon: Icons.palette_outlined,
+              title: '外观工坊',
+              isLight: isLight,
+              onTap: () => context.push('/neo-workshop'),
+            ),
 
           // Logout
           const SizedBox(height: 24),
