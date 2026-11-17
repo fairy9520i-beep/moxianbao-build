@@ -563,6 +563,9 @@ class _ScriptListPageState extends ConsumerState<ScriptListPage> {
   /// 折叠时 `remove`、展开时 `add`，重新展开会自动排到末尾。
   final Set<String> _expandedDirs = <String>{};
 
+  /// 顶层分类（按目录）的展开状态；空集合 = 全部折叠。
+  final Set<String> _expandedTopGroups = <String>{};
+
   @override
   void initState() {
     super.initState();
@@ -900,28 +903,102 @@ class _ScriptListPageState extends ConsumerState<ScriptListPage> {
                       color: AppColors.primary,
                       onRefresh: () =>
                           ref.read(scriptProvider.notifier).loadTree(),
-                      child: ListView(
-                        padding: const EdgeInsets.fromLTRB(20, 0, 20, 24),
-                        children: visibleTree
-                            .map(
-                              (file) => _FileTreeItem(
-                                file: file,
-                                isLight: isLight,
-                                depth: 0,
-                                expandedDirs: _expandedDirs,
-                                onTap: (path) => _openScript(path),
-                                onToggle: _toggleDirectory,
-                                onAction: (entry) =>
-                                    _handleEntryAction(entry, state),
+                      child: state.keyword.isNotEmpty
+                          ? ListView(
+                              padding: const EdgeInsets.fromLTRB(
+                                20,
+                                0,
+                                20,
+                                24,
                               ),
+                              children: visibleTree
+                                  .map(
+                                    (file) => _FileTreeItem(
+                                      file: file,
+                                      isLight: isLight,
+                                      depth: 0,
+                                      expandedDirs: _expandedDirs,
+                                      onTap: (path) => _openScript(path),
+                                      onToggle: _toggleDirectory,
+                                      onAction: (entry) =>
+                                          _handleEntryAction(entry, state),
+                                    ),
+                                  )
+                                  .toList(),
                             )
-                            .toList(),
-                      ),
+                          : _buildGroupedTree(visibleTree, isLight, state),
                     ),
             ),
           ],
         ),
       ),
+    );
+  }
+
+  /// 按顶层目录把脚本归成一组一组的卡片。
+  List<_ScriptTopGroup> _groupTop(List<ScriptFile> tree) {
+    final order = <String>[];
+    final map = <String, _ScriptTopGroup>{};
+
+    for (final entry in tree) {
+      final name = entry.isDirectory ? entry.name : '根目录';
+      if (!map.containsKey(name)) {
+        order.add(name);
+        map[name] = _ScriptTopGroup(name: name);
+      }
+      final group = map[name]!;
+      group.entries.add(entry);
+      group.fileCount += _countFiles(entry);
+    }
+    return [for (final name in order) map[name]!];
+  }
+
+  int _countFiles(ScriptFile node) {
+    if (!node.isDirectory) return 1;
+    var total = 0;
+    for (final child in node.children) {
+      total += _countFiles(child);
+    }
+    return total;
+  }
+
+  Widget _buildGroupedTree(
+    List<ScriptFile> tree,
+    bool isLight,
+    ScriptState state,
+  ) {
+    final groups = _groupTop(tree);
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(20, 0, 20, 24),
+      children: [
+        for (final group in groups) ...[
+          _ScriptGroupHeader(
+            name: group.name,
+            fileCount: group.fileCount,
+            expanded: _expandedTopGroups.contains(group.name),
+            isLight: isLight,
+            onTap: () => setState(() {
+              if (_expandedTopGroups.contains(group.name)) {
+                _expandedTopGroups.remove(group.name);
+              } else {
+                _expandedTopGroups.add(group.name);
+              }
+            }),
+          ),
+          if (_expandedTopGroups.contains(group.name))
+            ...group.entries.map(
+              (file) => _FileTreeItem(
+                file: file,
+                isLight: isLight,
+                depth: 0,
+                expandedDirs: _expandedDirs,
+                onTap: (path) => _openScript(path),
+                onToggle: _toggleDirectory,
+                onAction: (entry) => _handleEntryAction(entry, state),
+              ),
+            ),
+        ],
+      ],
     );
   }
 
@@ -3156,6 +3233,92 @@ class _ScriptDebugRunSheetState extends State<_ScriptDebugRunSheet> {
                 ),
               ),
             ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+
+class _ScriptTopGroup {
+  final String name;
+  final List<ScriptFile> entries = [];
+  int fileCount = 0;
+
+  _ScriptTopGroup({required this.name});
+}
+
+class _ScriptGroupHeader extends StatelessWidget {
+  final String name;
+  final int fileCount;
+  final bool expanded;
+  final bool isLight;
+  final VoidCallback onTap;
+
+  const _ScriptGroupHeader({
+    required this.name,
+    required this.fileCount,
+    required this.expanded,
+    required this.isLight,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final surfaces = AppSurfaces.of(context);
+    final radius = BorderRadius.circular(AppSurfaces.cardRadius);
+
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: Material(
+        color: surfaces.card,
+        borderRadius: radius,
+        child: InkWell(
+          onTap: onTap,
+          borderRadius: radius,
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+            decoration: BoxDecoration(
+              borderRadius: radius,
+              border: Border.all(color: surfaces.cardBorder),
+            ),
+            child: Row(
+              children: [
+                Icon(
+                  expanded ? Icons.folder_open : Icons.folder_outlined,
+                  size: 18,
+                  color: AppColors.primary,
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    name,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 14,
+                      fontWeight: FontWeight.w700,
+                      color: surfaces.strongText,
+                    ),
+                  ),
+                ),
+                Text(
+                  '$fileCount 个文件',
+                  style: TextStyle(fontSize: 11, color: surfaces.mutedText),
+                ),
+                const SizedBox(width: 2),
+                AnimatedRotation(
+                  turns: expanded ? 0.25 : 0,
+                  duration: const Duration(milliseconds: 180),
+                  child: Icon(
+                    Icons.chevron_right,
+                    size: 18,
+                    color: surfaces.mutedText,
+                  ),
+                ),
+              ],
+            ),
           ),
         ),
       ),
