@@ -100,8 +100,13 @@ class _MainScaffoldState extends ConsumerState<MainScaffold> {
       child: Scaffold(
         body: widget.child,
         extendBody: true,
-        bottomNavigationBar: ClipRRect(
-          borderRadius: BorderRadius.circular(appearance.navRadius),
+        bottomNavigationBar: Padding(
+          // 悬浮 Dock：左右留白，底边交给 SafeArea，浮在内容上方。
+          padding: appearance.navFloating
+              ? const EdgeInsets.fromLTRB(14, 0, 14, 8)
+              : EdgeInsets.zero,
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(appearance.navRadius),
           child: BackdropFilter(
             filter: ImageFilter.blur(
               sigmaX: appearance.navBlur,
@@ -121,6 +126,7 @@ class _MainScaffoldState extends ConsumerState<MainScaffold> {
               ),
               child: SafeArea(
                 top: false,
+                bottom: !appearance.navFloating,
                 child: Padding(
                   padding: const EdgeInsets.symmetric(
                     horizontal: 8,
@@ -168,6 +174,7 @@ class _MainScaffoldState extends ConsumerState<MainScaffold> {
                 ),
               ),
             ),
+          ),
           ),
         ),
       ),
