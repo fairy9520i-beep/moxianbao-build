@@ -120,6 +120,29 @@ class AppWorkshopPage extends ConsumerWidget {
           const SizedBox(height: 20),
           const AppSectionTitle('底部导航栏', padding: EdgeInsets.only(left: 2)),
           const SizedBox(height: 8),
+          AppCard(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 4),
+            child: SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('悬浮玻璃 Dock'),
+              subtitle: Text(
+                '像 QQ 那样浮起来，四周留白',
+                style: TextStyle(fontSize: 12, color: surfaces.mutedText),
+              ),
+              value: appearance.navFloating,
+              activeThumbColor: AppColors.primary,
+              onChanged: (value) => apply(
+                appearance.copyWith(
+                  navFloating: value,
+                  // 打开悬浮时给一个像样的默认圆角，避免直角浮块。
+                  navRadius: value && appearance.navRadius < 12
+                      ? 22
+                      : appearance.navRadius,
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(height: 10),
           _SliderTile(
             title: '栏体透明度',
             value: appearance.navOpacity,
