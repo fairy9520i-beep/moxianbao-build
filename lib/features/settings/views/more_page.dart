@@ -243,12 +243,6 @@ class _MorePageState extends ConsumerState<MorePage> {
             onTap: () => context.push('/server-config?manage=1'),
           ),
           _SettingsItem(
-            icon: Icons.palette_outlined,
-            title: '外观工坊',
-            isLight: isLight,
-            onTap: () => context.push('/neo-workshop'),
-          ),
-          _SettingsItem(
             icon: Icons.key_outlined,
             title: '环境变量',
             isLight: isLight,
